@@ -1,0 +1,32 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# 模型权重不入库（另行下载）
+models/**/*.pth
+models/**/*.pkl
+models/**/*.safetensors
+models/**/*.onnx
+models/**/*.ncnn/
+
+# 输出与缓存
+output/
+tmp/
+*.log
+
+# IDE / 系统
+.idea/
+.vscode/
+Thumbs.db
+desktop.ini
+models/**/*.trt
+models/**/*.onnx
+
+# 测试素材与基准产物不入库（体积大且含版权内容）
+tests/*.mp4
+tests/*.MP4
+tests/*.png
+tests/bench/

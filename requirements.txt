@@ -1,0 +1,8 @@
+# torch 需 CUDA 12.8 索引（RTX 50 系 Blackwell 必需）：
+#   pip install torch torchvision --index-url https://download.pytorch.org/whl/cu128
+torch
+torchvision
+spandrel>=0.4
+opencv-python-headless
+numpy
+tqdm

@@ -1,0 +1,18 @@
+[project]
+name = "crispframe"
+version = "0.1.0"
+description = "开源 AI 视频画质增强套件：超分、插帧、面部增强、去噪、防抖 —— 让每一帧都锐利"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+
+[project.scripts]
+crispframe = "crispframe.cli:main"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["crispframe*"]
+exclude = ["tests*", "docs*", "models*", "vendor*"]
