@@ -23,10 +23,14 @@ tmp/
 Thumbs.db
 desktop.ini
 models/**/*.trt
-models/**/*.onnx
+models/SEEDVR2/
 
 # 测试素材与基准产物不入库（体积大且含版权内容）
-tests/*.mp4
-tests/*.MP4
-tests/*.png
+tests/**/*.mp4
+tests/**/*.MP4
+tests/**/*.png
+tests/**/*.jpg
 tests/bench/
+
+# 第三方上游仓库（Apache-2.0），保留 .git 便于跟进上游更新
+vendor/seedvr2/

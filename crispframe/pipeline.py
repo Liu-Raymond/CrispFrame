@@ -52,6 +52,11 @@ def _encoder_cmd(info: VideoInfo, out_size: tuple[int, int], out_fps: float,
         "-r", f"{out_fps:.6f}", "-i", "-",
         "-i", str(info.path),
         "-map", "0:v:0", "-map", "1:a?", "-c:a", "copy",
+        # RGB(bgr24, full)→YUV 转换显式用 bt709/limited（ffmpeg 默认 bt601 会造成色偏），
+        # 并把元数据写入输出，播放器才不会二次误读
+        "-vf", "scale=out_color_matrix=bt709:out_range=tv",
+        "-colorspace", "bt709", "-color_primaries", "bt709", "-color_trc", "bt709",
+        "-color_range", "tv",
         "-c:v", cfg.encoder, "-preset", cfg.preset,
         "-rc", "vbr", "-cq", str(cfg.crf), "-b:v", "0",
         "-pix_fmt", cfg.pix_fmt,
@@ -68,8 +73,14 @@ def run(
     encode: EncodeConfig | None = None,
     batch_size: int = 1,
     max_seconds: float | None = None,
+    progress_callback=None,
+    cancel_check=None,
 ) -> dict:
-    """执行完整管线，返回统计 dict（帧数、耗时、处理 fps）。"""
+    """执行完整管线。
+
+    progress_callback(done:int, total:int)：每帧回调（GUI 进度条用）。
+    cancel_check() -> bool：返回 True 时中止处理（GUI 停止按钮用）。
+    """
     stages = stages or []
     encode = encode or EncodeConfig()
     batch_size = max(1, batch_size)
@@ -130,16 +141,22 @@ def run(
             prev = frame
 
     assert decoder.stdout is not None
-    pbar = tqdm(total=total or None, unit="f", dynamic_ncols=True,
-                desc=f"CrispFrame {info.path.name}")
+    pbar = None if progress_callback else tqdm(
+        total=total or None, unit="f", dynamic_ncols=True,
+        desc=f"CrispFrame {info.path.name}")
     try:
         while True:
+            if cancel_check and cancel_check():
+                break
             raw = decoder.stdout.read(frame_bytes_in)
             if not raw or len(raw) < frame_bytes_in:
                 break
             pending.append(np.frombuffer(raw, np.uint8).reshape(info.height, info.width, 3))
             stats["frames_in"] += 1
-            pbar.update(1)
+            if pbar:
+                pbar.update(1)
+            elif progress_callback:
+                progress_callback(stats["frames_in"], total or 0)
             if len(pending) >= batch_size:
                 flush(pending)
                 pending = []
@@ -148,7 +165,8 @@ def run(
             pending = []
     finally:
         # 只做清理和错误收集，不在这里 raise——避免掩盖循环里的真实异常
-        pbar.close()
+        if pbar:
+            pbar.close()
         if decoder.stdout:
             decoder.stdout.close()
         dec_err = decoder.stderr.read().decode(errors="replace") if decoder.stderr else ""

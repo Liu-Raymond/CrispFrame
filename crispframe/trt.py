@@ -69,7 +69,8 @@ def build_engine(onnx_path: Path, engine_path: Path, fp16: bool = True) -> None:
         errs = "\n".join(str(parser.get_error(i)) for i in range(parser.num_errors))
         raise RuntimeError(f"ONNX 解析失败:\n{errs}")
     config = builder.create_builder_config()
-    config.set_memory_pool_limit(trt.MemoryPoolType.WORKSPACE, 4 << 30)
+    # ESRGAN 类 4x 模型在 720p 输入下激活内存即超 5GB，4GB workspace 会静默构建失败
+    config.set_memory_pool_limit(trt.MemoryPoolType.WORKSPACE, 12 << 30)
     serialized = builder.build_serialized_network(network, config)
     if serialized is None:
         raise RuntimeError("TensorRT 引擎构建失败")

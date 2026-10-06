@@ -14,7 +14,7 @@ from .registry import ModelSpec
 class SuperRes:
     def __init__(self, spec: ModelSpec, device: str = "cuda", use_amp: bool = True,
                  batch_size: int = 4, compile_model: bool = False, channels_last: bool = True,
-                 use_trt: bool = True):
+                 use_trt: bool = True, tone_match: bool = False):
         model = ModelLoader().load_from_file(str(spec.path))
         if not isinstance(model, ImageModelDescriptor):
             raise TypeError(f"{spec.path} 不是图像超分模型")
@@ -37,6 +37,9 @@ class SuperRes:
             self._compiled = True
         self.use_trt = use_trt and device.startswith("cuda")
         self.runner = None  # TensorRT 引擎，首帧按实际 shape 构建并缓存
+        # 部分 SR 模型有固有 tone shift（如 Nomos8k 系偏暗 ~2%）；开启后把输出
+        # 亮度统计（luma 均值/标准差）逐帧对齐输入源，消除观感色偏
+        self.tone_match = tone_match
 
     def _trt_engine(self, t: torch.Tensor):
         import tensorrt as _trt  # noqa: N813
@@ -86,6 +89,17 @@ class SuperRes:
                 out = self._torch_forward(t)
         else:
             out = self._torch_forward(t)
+        if self.tone_match:
+            ref = torch.nn.functional.interpolate(t, size=out.shape[-2:], mode="bicubic",
+                                                  align_corners=False)
+            # bt709 luma；仅对齐亮度均值/标准差，不动色彩
+            w = torch.tensor([0.2126, 0.7152, 0.0722], device=out.device).view(1, 3, 1, 1)
+            out_y = (out * w).sum(1, keepdim=True)
+            ref_y = (ref * w).sum(1, keepdim=True)
+            gain = (ref_y.std() / (out_y.std() + 1e-6)).clamp(0.8, 1.25)
+            bias = (ref_y.mean() - out_y.mean() * gain).clamp(-0.15, 0.15)
+            out = out * gain + bias
+            out = out.clamp_(0, 1)
         out = out.flip(1).float().clamp_(0, 1).mul_(255.0).round_().byte()
         # contiguous 化在 GPU 上做，保证 d2h 后可直接 memoryview/写管道
         arr = out.permute(0, 2, 3, 1).contiguous().cpu().numpy()

@@ -22,7 +22,7 @@ CrispFrame 的答案：把"模型怎么选、参数怎么配"的知识固化成*
 ```
 解码(ffmpeg/PyAV) → 去压缩伪影(deH26x) → 去噪(NAFNet/SCUNet)
   → 超分(真人 RealESRGAN/4xNomos8k · 动画 AnimeJaNai)
-  → 面部增强(CodeFormer) → 插帧(RIFE 4.26 / GIMM-VFI) / 防抖(vidstab)
+  → 面部增强(CodeFormer + YuNet 检测，区域修复) → 插帧(RIFE 4.26 / GIMM-VFI) / 防抖(vidstab)
   → 编码(NVENC AV1 视觉无损 25-35 Mbps)
 ```
 
@@ -104,3 +104,10 @@ tests/
 - 帧的 BGR→RGB/归一化/pad/量化/contiguous 全在 GPU 做，CPU 只做裸 24MB 拷贝——这一项给 4K 插帧带来 2.8 倍
 - torch.compile（Windows 需 triton-windows）仅对 Compact 小模型有收益，SPAN 类自动回退，默认关闭
 - 引擎按 (模型,shape,精度) 缓存于 models/engines/，首次构建 1-2 分钟，之后秒级加载
+
+## 面部增强（M1.5，已实现）
+
+- **YuNet**（OpenCV DNN，232KB ONNX）人脸检测：降采样自适应（检测图短边 ~900px）、框坐标量化 + 跨帧 EMA 平滑抑制抖动
+- **CodeFormer**（spandrel-extra-arches 加载，bf16）：只对人脸区域修复（512x512，fidelity 可调 `--face-w`，默认 0.7）
+- 羽化混合在 512 空间完成再一次性 resize 贴回（4K 大图 float 混合是耗时大户，已规避）
+- 性能：720p→4K 超分+面部 6.7 帧/s；全链（+4K60 插帧）5.1 帧/s

@@ -14,6 +14,7 @@ from pathlib import Path
 from . import registry
 from .ffutils import probe
 from .pipeline import EncodeConfig, run
+from .gpu_post import GpuPost
 from .sr import SuperRes
 
 
@@ -51,7 +52,20 @@ def build_stages(args, info) -> list:
         spec = resolve_for(args.model)
         batch = args.batch or _auto_batch(spec, info.width, info.height)
         stages.append(SuperRes(spec, use_amp=use_amp, batch_size=batch,
-                               compile_model=args.compile, use_trt=not args.no_trt))
+                               compile_model=args.compile, use_trt=not args.no_trt,
+                               tone_match=args.tone_match))
+    if args.face:
+        from .face import FaceEnhance
+        stages.append(FaceEnhance(fidelity=args.face_w))
+    if args.target_res or args.sharpen > 0:
+        from .gpu_post import GpuPost
+        # 默认目标分辨率：SR 输出原分辨率（无 resize 时不做缩放）
+        w, _, h = (args.target_res or "").partition("x")
+        if not w:
+            spec = resolve_for(args.model) if args.model != "off" else None
+            scale = spec.scale if spec else 1
+            w, h = str(info.width * scale), str(info.height * scale)
+        stages.append(GpuPost(int(w), int(h), sharpen=args.sharpen))
     return stages
 
 
@@ -105,6 +119,20 @@ def main(argv=None) -> int:
     ap.add_argument("--fp32", action="store_true", help="禁用 bf16 半精度（质量最优先）")
     ap.add_argument("--batch", type=int, default=0,
                     help="批处理帧数；0 = 自动（按输出分辨率：4K 取 1-2，低分辨率取 4-8）")
+    ap.add_argument("--face", action="store_true", help="超分后对人脸区域做 CodeFormer 修复")
+    ap.add_argument("--face-w", type=float, default=0.8,
+                    help="面部保真度 0-1：低=更'AI 修复'（细节多但可能改变五官内容），高=更保真（默认 0.8）")
+    ap.add_argument("--extreme", action="store_true",
+                    help="极致画质档：改用 SeedVR2 生成式修复（~0.2 帧/s，质量超快速档，长片慎用）")
+    ap.add_argument("--extreme-res", type=int, default=2160,
+                    help="极致档输出高度（默认 2160=4K）")
+    ap.add_argument("--target-res", default=None,
+                    help="输出分辨率 WxH（如 3840x2160）。SR 后先缩放到该分辨率再锐化——"
+                         "超必要分辨率交给播放器缩放会整体发软，建议对齐显示设备原生分辨率")
+    ap.add_argument("--sharpen", type=float, default=0,
+                    help="unsharp 锐化幅度 0-2（SR 会放大源的运动模糊；0.6-1.0 可恢复商业软件式的'锐'观感）")
+    ap.add_argument("--tone-match", action="store_true",
+                    help="把输出的亮度/对比度统计逐帧对齐输入源（修正部分 SR 模型固有的偏暗/发灰）")
     ap.add_argument("--no-trt", action="store_true", help="禁用 TensorRT 后端（回退 PyTorch）")
     ap.add_argument("--rife-scale", type=float, default=0,
                     help="RIFE 光流计算尺度；0 = auto（≥1440p 用 0.5，官方 UHD 模式，约省 4 倍算力）")
@@ -132,6 +160,18 @@ def main(argv=None) -> int:
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
     info = probe(args.input)
+
+    if args.extreme:
+        from .extreme import run_seedvr2
+        print(f"极致档（SeedVR2 生成式）：输出高度 {args.extreme_res}px，速度 ~0.2 帧/s，请耐心等待")
+        result = run_seedvr2(args.input, out_path.parent, resolution=args.extreme_res,
+                             max_frames=int(args.max_seconds * info.fps) if args.max_seconds else None)
+        if args.output and result.resolve() != out_path.resolve():
+            result.replace(out_path)
+        size_mb = out_path.stat().st_size / 1e6
+        print(f"\n完成: {out_path.name} {size_mb:.1f} MB")
+        return 0
+
     print(f"输入: {info.width}x{info.height} @ {info.fps:.3f}fps, {info.frames or '?'} 帧, {info.duration:.1f}s")
     stages = build_stages(args, info)
     interpolator = build_interpolator(args, info)
