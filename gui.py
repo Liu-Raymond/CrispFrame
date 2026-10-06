@@ -961,7 +961,16 @@ class MainWindow(QMainWindow):
         self.worker = None
 
 
+def _excepthook(t, v, tb):
+    """双击启动（pythonw 无控制台）时把崩溃留档，否则错误无声消失。"""
+    import traceback
+    (Path(__file__).parent / "crash.log").write_text(
+        "".join(traceback.format_exception(t, v, tb)), encoding="utf-8")
+    sys.__stderr__ and sys.__stderr__.write(str(v))
+
+
 def main():
+    sys.excepthook = _excepthook
     app = QApplication(sys.argv)
     app.setStyleSheet(DARK_QSS)
     win = MainWindow()
