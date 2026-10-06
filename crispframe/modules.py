@@ -141,23 +141,25 @@ class _DenoiseSpec(ModuleSpec):
         return "SCUNet 去噪 1x"
 
 
-# 超分模型选项（仅 role=sr，按推荐排序）
+# 超分模型选项（仅 role=sr，按推荐排序；元组 = (显示, 值)）
 _SR_CHOICES = [
-    ("nomosuni",     "NomosUni 2x（真人·推荐）"),
-    ("anime",        "AnimeJaNai 2x（动漫·推荐）"),
-    ("clearreality", "ClearReality 4x"),
-    ("ultrasharp",   "UltraSharp 4x"),
-    ("nomos8k-weak", "Nomos8k 4x（弱去噪）"),
-    ("nomos8k",      "Nomos8k 4x（强去噪）"),
-    ("x4plus",       "RealESRGAN 4x"),
+    ("NomosUni 2x（真人·推荐）", "nomosuni"),
+    ("AnimeJaNai 2x（动漫·推荐）", "anime"),
+    ("ClearReality 4x", "clearreality"),
+    ("UltraSharp 4x", "ultrasharp"),
+    ("Nomos8k 4x（弱去噪）", "nomos8k-weak"),
+    ("Nomos8k 4x（强去噪）", "nomos8k"),
+    ("RealESRGAN 4x", "x4plus"),
 ]
+_SR_DISPLAY = {v: d for d, v in _SR_CHOICES}
 
 _TARGET_CHOICES = [
-    ("", "自动（源 × 模型倍数）"),
-    ("3840x2160", "3840x2160（4K UHD）"),
-    ("2560x1440", "2560x1440（2K QHD）"),
-    ("1920x1080", "1920x1080（FHD）"),
+    ("自动（源 × 模型倍数）", ""),
+    ("3840x2160（4K UHD）", "3840x2160"),
+    ("2560x1440（2K QHD）", "2560x1440"),
+    ("1920x1080（FHD）", "1920x1080"),
 ]
+_TARGET_DISPLAY = {v: d for d, v in _TARGET_CHOICES}
 
 
 class _SuperResSpec(ModuleSpec):
@@ -191,8 +193,8 @@ class _SuperResSpec(ModuleSpec):
         return BuiltModule(stages=stages)
 
     def summary(self, params: dict) -> str:
-        model = dict(_SR_CHOICES).get(params["model"], params["model"])
-        target = dict(_TARGET_CHOICES).get(params["target_res"], params["target_res"])
+        model = _SR_DISPLAY.get(params["model"], params["model"])
+        target = _TARGET_DISPLAY.get(params["target_res"], params["target_res"])
         short = target.split("（")[0] or "自动"
         return f"{model.split('（')[0]} · 锐化{params['sharpen']:.1f} · {short}"
 

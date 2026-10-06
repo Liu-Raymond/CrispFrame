@@ -6,6 +6,7 @@
 """
 from __future__ import annotations
 
+import copy
 import sys
 import time
 from dataclasses import dataclass, field
@@ -169,8 +170,39 @@ class Worker(QThread):
 
 # ---------------------------------------------------------------- 模块链 UI
 
+class ModuleParamDialog(QDialog):
+    """模块参数编辑：按 ParamSpec 自动生成，确定后写回实例。"""
+
+    def __init__(self, inst: ModuleInstance, parent=None):
+        super().__init__(parent)
+        self.inst = inst   # 调用方传入的是工作副本；accept 后由调用方写回
+        self.setWindowTitle(f"{inst.spec.name} — 参数")
+        self.setMinimumWidth(480)
+        v = QVBoxLayout(self)
+        desc = QLabel(inst.spec.description)
+        desc.setStyleSheet("color:#9aa0a8;")
+        desc.setWordWrap(True)
+        v.addWidget(desc)
+        if inst.spec.params:
+            from gui_preview import ParamPanel
+            v.addWidget(ParamPanel(inst))
+        else:
+            v.addWidget(QLabel("此模块没有可调参数。"))
+        row = QHBoxLayout()
+        row.addStretch()
+        ok = QPushButton("确定")
+        ok.setObjectName("startBtn")
+        ok.clicked.connect(self.accept)
+        cancel = QPushButton("取消")
+        cancel.clicked.connect(self.reject)
+        row.addWidget(ok)
+        row.addWidget(cancel)
+        v.addLayout(row)
+
+
 class ModuleRow(QFrame):
     previewRequested = Signal(object)   # ModuleInstance
+    configApplied = Signal(object)      # ModuleInstance（参数写回后）
     removed = Signal(object)
     toggled = Signal(object, bool)
 
@@ -193,9 +225,14 @@ class ModuleRow(QFrame):
         self.summary_lab.setStyleSheet("color:#9aa0a8;font-size:12px;")
         col.addWidget(self.summary_lab)
         h.addLayout(col, 1)
+        if inst.spec.params:
+            cfg = QPushButton("⚙ 参数")
+            cfg.setToolTip("选模型 / 调参数")
+            cfg.clicked.connect(self._open_config)
+            h.addWidget(cfg)
         if has_src:
             pv = QPushButton("👁 预览")
-            pv.setToolTip("只渲染本模块的单独效果，用于对比选型")
+            pv.setToolTip("渲染一段/一帧本模块的单独效果，用于对比选型")
             pv.clicked.connect(lambda: self.previewRequested.emit(self.inst))
             h.addWidget(pv)
         self.switch = QCheckBox()
@@ -208,6 +245,15 @@ class ModuleRow(QFrame):
         rm.setToolTip("从链中移除")
         rm.clicked.connect(lambda: self.removed.emit(self.inst))
         h.addWidget(rm)
+
+    def _open_config(self):
+        work = ModuleInstance(self.inst.key, copy.deepcopy(self.inst.params),
+                              self.inst.enabled)
+        dlg = ModuleParamDialog(work, self.window())
+        if dlg.exec() == QDialog.Accepted:
+            self.inst.params = work.params
+            self.refresh()
+            self.configApplied.emit(self.inst)
 
     def refresh(self):
         self.summary_lab.setText(self.inst.summary())
@@ -253,6 +299,7 @@ class ModuleChainList(QWidget):
                 item.setData(Qt.UserRole, inst)
                 row = ModuleRow(inst, has_src=self.task is not None)
                 row.previewRequested.connect(self.previewRequested.emit)
+                row.configApplied.connect(lambda _: self.chainChanged.emit())
                 row.removed.connect(self._remove)
                 row.toggled.connect(self._toggle)
                 item.setSizeHint(row.sizeHint())

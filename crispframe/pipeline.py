@@ -43,9 +43,12 @@ class Interpolator:
 
 
 def _decoder_cmd(info: VideoInfo, max_seconds: float | None,
-                 extra_vf: list[str] | None = None) -> list[str]:
-    cmd = [ffmpeg(), "-nostdin", "-hide_banner", "-loglevel", "error",
-           "-i", str(info.path), "-map", "0:v:0"]
+                 extra_vf: list[str] | None = None,
+                 start: float | None = None) -> list[str]:
+    cmd = [ffmpeg(), "-nostdin", "-hide_banner", "-loglevel", "error"]
+    if start:
+        cmd += ["-ss", f"{start:.3f}"]   # -ss 在 -i 前 = 关键帧快定位
+    cmd += ["-i", str(info.path), "-map", "0:v:0"]
     if extra_vf:
         cmd += ["-vf", ",".join(extra_vf)]
     if max_seconds:
@@ -94,11 +97,13 @@ def run(
     encode: EncodeConfig | None = None,
     batch_size: int = 1,
     max_seconds: float | None = None,
+    start: float | None = None,
     progress_callback=None,
     cancel_check=None,
 ) -> dict:
     """执行完整管线。
 
+    start：从源的指定秒数开始（预览选段用）。
     progress_callback(done:int, total:int)：每帧回调（GUI 进度条用）。
     cancel_check() -> bool：返回 True 时中止处理（GUI 停止按钮用）。
     """
@@ -107,13 +112,16 @@ def run(
     batch_size = max(1, batch_size)
     frame_bytes_in = info.width * info.height * 3
     out_fps = info.fps * (2 if interpolator is not None else 1)
-    if max_seconds:
-        total = int(min(info.duration or 1e9, max_seconds) * info.fps)
+    if max_seconds is not None or start:
+        remaining = max(0.0, (info.duration or 1e9) - (start or 0.0))
+        total = int(min(max_seconds if max_seconds is not None else 1e9,
+                        remaining) * info.fps)
     else:
         total = info.frames
 
     decoder = subprocess.Popen(
-        _decoder_cmd(info, max_seconds, encode.decode_vf), stdout=subprocess.PIPE,
+        _decoder_cmd(info, max_seconds, encode.decode_vf, start),
+        stdout=subprocess.PIPE,
         stderr=subprocess.PIPE, bufsize=frame_bytes_in * (batch_size + 2),
     )
     encoder: subprocess.Popen | None = None

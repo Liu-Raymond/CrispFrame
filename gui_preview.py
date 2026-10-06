@@ -1,30 +1,35 @@
-"""模块级预览对话框：当前帧只进目标模块（不经链上其他环节），用于横向选模型/调参。
+"""模块级预览对话框：当前帧/选段只进目标模块（不经链上其他环节），横向选模型/调参。
 
-- 时间轴：QSlider 拖动 = ffmpeg 快速 seek 抽帧显示
-- 渲染：按模块注册表真实构建该模块的 stage（所见即所得）
-- 插帧模块：取 t 与下一帧做真实 midframe
-- 放大：QGraphicsView 滚轮缩放 + 拖动平移
-- 对比：4 个配置槽位（A/B/C/D），槽位记录当时的参数快照
+- 时间轴：QSlider 拖动 = ffmpeg 快速 seek 抽帧；片段渲染以当前位置为起点
+- 片段渲染：真实管线跑一段（默认 10s，5-30s 可选），草稿编码（x264 veryfast），
+  完成后内嵌播放器自动循环播放，可存入 A/B/C/D 槽位对比
+- 帧渲染：单帧静态对比（快速看效果）
+- 插帧模块：帧渲染取相邻帧真实 midframe；片段渲染走完整插帧管线
+- 放大：QGraphicsView 滚轮缩放 + 拖动平移（仅静态帧）
 """
 from __future__ import annotations
 
 import copy
 import subprocess
 import tempfile
+import time
 from pathlib import Path
 
 import cv2
 import numpy as np
-from PySide6.QtCore import Qt, QThread, Signal
+from PySide6.QtCore import Qt, QThread, Signal, QUrl
 from PySide6.QtGui import QImage, QPixmap
+from PySide6.QtMultimedia import QAudioOutput, QMediaPlayer
+from PySide6.QtMultimediaWidgets import QVideoWidget
 from PySide6.QtWidgets import (
     QCheckBox, QComboBox, QDialog, QGraphicsScene, QGraphicsView, QGridLayout,
-    QHBoxLayout, QLabel, QPushButton, QSlider, QVBoxLayout, QWidget,
+    QHBoxLayout, QLabel, QProgressBar, QPushButton, QSlider, QStackedWidget,
+    QVBoxLayout, QWidget,
 )
 
-from crispframe import modules
 from crispframe.ffutils import VideoInfo, ffmpeg, probe
 from crispframe.modules import BuildContext, ModuleInstance
+from crispframe.pipeline import EncodeConfig, run as pipeline_run
 
 
 def frame_to_pixmap(bgr: np.ndarray) -> QPixmap:
@@ -62,7 +67,7 @@ class SeekThumb(QThread):
 
 
 class RenderModule(QThread):
-    """后台渲染：当前帧只过目标模块。插帧模块取相邻两帧做真实 midframe。"""
+    """后台渲染单帧：当前帧只过目标模块。插帧模块取相邻两帧做真实 midframe。"""
     got = Signal(object, str)  # np.ndarray | None, message
 
     def __init__(self, src: Path, t: float, inst: ModuleInstance, label: str):
@@ -90,6 +95,46 @@ class RenderModule(QThread):
                 out = seq[0]
             self.got.emit(out, self.label)
         except Exception as e:  # noqa: BLE001
+            self.got.emit(None, f"{self.label}（失败: {e}）")
+
+
+class RenderSegment(QThread):
+    """后台渲染选段：真实管线 + 草稿编码（x264 veryfast，兼容性最好）。
+    完成后 got 发射临时 mp4 路径（None = 失败/零帧）。"""
+    progress = Signal(int, int)
+    got = Signal(object, str)
+
+    def __init__(self, src: Path, start: float, duration: float,
+                 inst: ModuleInstance, label: str):
+        super().__init__()
+        # 注意不能叫 self.start——会覆盖 QThread.start() 方法
+        self.src, self.t0, self.dur = src, start, duration
+        self.inst, self.label = inst, label
+        self._cancel = False
+
+    def cancel(self):
+        self._cancel = True
+
+    def run(self):
+        out = Path(tempfile.gettempdir()) / f"cf_seg_{int(time.time() * 1000)}.mp4"
+        try:
+            info: VideoInfo = probe(self.src)
+            ctx = BuildContext(width=info.width, height=info.height, fps=info.fps)
+            built = self.inst.spec.build(self.inst.params, ctx)
+            encode = EncodeConfig(
+                args=["-c:v", "libx264", "-preset", "veryfast",
+                      "-crf", "18", "-pix_fmt", "yuv420p"],
+                audio_args=["-an"],           # 预览段不带音轨：兼容性 + 省时间
+            )
+            stats = pipeline_run(
+                info, out, stages=built.stages, interpolator=built.interpolator,
+                encode=encode, batch_size=1, start=self.t0,
+                max_seconds=self.dur,
+                progress_callback=lambda d, t: self.progress.emit(d, t),
+                cancel_check=lambda: self._cancel)
+            self.got.emit(out if stats["frames_out"] > 0 else None, self.label)
+        except Exception as e:  # noqa: BLE001
+            out.unlink(missing_ok=True)
             self.got.emit(None, f"{self.label}（失败: {e}）")
 
 
@@ -129,7 +174,6 @@ class ParamPanel(QWidget):
         self.inst = inst
         grid = QGridLayout(self)
         grid.setContentsMargins(0, 0, 0, 0)
-        self._editors: dict[str, QWidget] = {}
         for r, p in enumerate(inst.spec.params):
             grid.addWidget(QLabel(p.label), r, 0)
             editor = self._make_editor(p)
@@ -146,9 +190,11 @@ class ParamPanel(QWidget):
             box = QComboBox()
             for disp, val in p.choices:
                 box.addItem(disp, val)
-            cur = next((i for i, (_, v) in enumerate(p.choices) if v == self.inst.params[p.key]), 0)
+            cur = next((i for i, (_, v) in enumerate(p.choices)
+                        if v == self.inst.params[p.key]), 0)
             box.setCurrentIndex(cur)
-            box.currentIndexChanged.connect(lambda _: self._set(p, box.currentData()))
+            box.currentIndexChanged.connect(
+                lambda _: self._set(p, box.currentData()))
             return box
         if p.kind == "bool":
             chk = QCheckBox()
@@ -164,17 +210,13 @@ class ParamPanel(QWidget):
         slider.setRange(0, steps)
         val = float(self.inst.params[p.key])
         slider.setValue(int(round((val - p.min) / p.step)))
-        lab = QLabel(self._fmt(p, val))
+        lab = QLabel(f"{val:g}")
         slider.valueChanged.connect(
-            lambda v: (lab.setText(self._fmt(p, p.min + v * p.step)),
+            lambda v: (lab.setText(f"{p.min + v * p.step:g}"),
                        self._set(p, p.min + v * p.step)))
         h.addWidget(slider, 1)
         h.addWidget(lab)
         return row
-
-    @staticmethod
-    def _fmt(p, v: float) -> str:
-        return f"{v:g}"
 
     def _set(self, p, value):
         self.inst.params[p.key] = p.coerce(value)
@@ -182,9 +224,11 @@ class ParamPanel(QWidget):
 
 
 class PreviewDialog(QDialog):
-    """模块预览：参数面板 + 时间轴 + 放大镜 + 4 槽位对比。"""
+    """模块预览：选段/单帧渲染 + 内嵌播放 + 参数面板 + 4 槽位对比。"""
 
     SLOT_KEYS = ["A", "B", "C", "D"]
+    SEG_DURATIONS = [("5 秒", 5.0), ("10 秒", 10.0), ("15 秒", 15.0),
+                     ("20 秒", 20.0), ("30 秒", 30.0)]
 
     def __init__(self, src: Path, inst: ModuleInstance, parent=None):
         super().__init__(parent)
@@ -193,19 +237,31 @@ class PreviewDialog(QDialog):
         self.info: VideoInfo = probe(src)
         self.setWindowTitle(f"模块预览 — {inst.spec.name} · {src.name}")
         self.resize(1280, 760)
-        self._render_thread: RenderModule | None = None
+        self._render_thread: QThread | None = None
         self._thumb_thread: SeekThumb | None = None
-        self.slots: dict[str, tuple[QPixmap, str]] = {}   # key -> (pixmap, summary)
+        self._seg_slot_key = "A"
+        self.slots: dict[str, dict] = {}      # key -> {kind: img|seg, payload, label}
 
         root = QVBoxLayout(self)
-        self.view = ZoomView()
-        root.addWidget(self.view, 1)
 
-        # 参数面板 + 渲染按钮
+        # 查看区：静态帧（缩放） / 片段播放器 二选一显示
+        self.view = ZoomView()
+        self.video_widget = QVideoWidget()
+        self.player = QMediaPlayer(self)
+        self.audio_out = QAudioOutput(self)
+        self.player.setAudioOutput(self.audio_out)
+        self.player.setVideoOutput(self.video_widget)
+        self.player.mediaStatusChanged.connect(self._on_media_status)
+        self.stack = QStackedWidget()
+        self.stack.addWidget(self.view)
+        self.stack.addWidget(self.video_widget)
+        root.addWidget(self.stack, 1)
+
+        # 参数面板 + 渲染控制
         ctl = QHBoxLayout()
         if self.inst.spec.params:
-            self.panel = ParamPanel(self.inst)
-        else:  # 无参模块（去压缩/降噪）：放模块说明，避免左侧一片空白像坏了
+            self.panel: QWidget = ParamPanel(self.inst)
+        else:  # 无参模块（去压缩/降噪）：放模块说明，避免左侧空白像坏了
             self.panel = QLabel(self.inst.spec.description)
             self.panel.setStyleSheet("color:#8a8f98;")
             self.panel.setWordWrap(True)
@@ -215,20 +271,36 @@ class PreviewDialog(QDialog):
         panel_holder.layout().addWidget(self.panel)
         panel_holder.layout().addStretch()
         ctl.addWidget(panel_holder, 1)
+
+        ctl.addWidget(QLabel("片段"))
+        self.seg_dur = QComboBox()
+        for disp, val in self.SEG_DURATIONS:
+            self.seg_dur.addItem(disp, val)
+        self.seg_dur.setCurrentIndex(1)
+        ctl.addWidget(self.seg_dur)
+        self.seg_btn = QPushButton("渲染片段")
+        self.seg_btn.setToolTip("从下方时间轴当前位置起，渲染一段真实效果并循环播放")
+        self.seg_btn.clicked.connect(self._render_segment)
+        ctl.addWidget(self.seg_btn)
+
         self.slot = QComboBox()
         self.slot.addItems(self.SLOT_KEYS)
         ctl.addWidget(QLabel("存入槽位"))
         ctl.addWidget(self.slot)
         self.render_btn = QPushButton("渲染此帧")
+        self.render_btn.setToolTip("只渲染当前这一帧（静态对比，最快）")
         self.render_btn.clicked.connect(self._render_current)
         ctl.addWidget(self.render_btn)
         root.addLayout(ctl)
 
+        self.bar = QProgressBar()
+        self.bar.setVisible(False)
+        root.addWidget(self.bar)
+
         # 槽位缩略图条
         slots_row = QHBoxLayout()
-        slots_tip = QLabel("对比槽位：换着参数各渲染一格，点缩略图切换对比")
+        slots_tip = QLabel("对比槽位：换着参数各渲染一段/一帧，点缩略图切换对比")
         slots_tip.setStyleSheet("color:#8a8f98;font-size:11px;")
-        slots_tip.setAlignment(Qt.AlignVCenter)
         slots_row.addWidget(slots_tip)
         slots_row.addSpacing(12)
         self.slot_labels: dict[str, QLabel] = {}
@@ -244,7 +316,7 @@ class PreviewDialog(QDialog):
         slots_row.addStretch()
         root.addLayout(slots_row)
 
-        # 时间轴
+        # 时间轴（选择源片位置）
         tl = QHBoxLayout()
         self.time_lab = QLabel("00:00.0")
         tl.addWidget(self.time_lab)
@@ -261,6 +333,8 @@ class PreviewDialog(QDialog):
     def _on_seek(self, v):
         t = v / 10
         self.time_lab.setText(f"{t // 60:02.0f}:{t % 60:04.1f}")
+        self.stack.setCurrentWidget(self.view)   # 拖时间轴 = 回到源片帧浏览
+        self.player.stop()
         self._show_original_at(t)
 
     def _show_original_at(self, t: float):
@@ -276,13 +350,24 @@ class PreviewDialog(QDialog):
     def _current_t(self) -> float:
         return self.slider.value() / 10
 
-    # —— 渲染 ——
+    # —— 播放器 ——
+    def _on_media_status(self, status):
+        if status == QMediaPlayer.MediaStatus.EndOfMedia:
+            self.player.setPosition(0)
+            self.player.play()
+
+    def _play_segment(self, path: Path):
+        self.stack.setCurrentWidget(self.video_widget)
+        if self.player.source() != QUrl.fromLocalFile(str(path)):
+            self.player.setSource(QUrl.fromLocalFile(str(path)))
+        self.player.play()
+
+    # —— 渲染：单帧 ——
     def _render_current(self):
-        if self._render_thread and self._render_thread.isRunning():
+        if self._busy():
             return
         self.render_btn.setEnabled(False)
         self.render_btn.setText("渲染中…")
-        # 参数快照：渲染用副本，槽位记录的就是这份配置
         inst = ModuleInstance(self.inst.key, copy.deepcopy(self.inst.params), True)
         self._render_thread = RenderModule(
             self.src, self._current_t(), inst, inst.summary())
@@ -292,20 +377,89 @@ class PreviewDialog(QDialog):
     def _on_rendered(self, img: np.ndarray | None, label: str):
         self.render_btn.setEnabled(True)
         self.render_btn.setText("渲染此帧")
+        slot = self.slot.currentText()
         if img is None:
-            self.view.set_image(frame_to_pixmap(grab_frame(self.src, self._current_t())
-                                                or np.zeros((360, 640, 3), np.uint8)))
             self.setWindowTitle(f"模块预览 — {label}")
             return
         pm = frame_to_pixmap(img)
+        self.stack.setCurrentWidget(self.view)
         self.view.set_image(pm)
-        slot = self.slot.currentText()
-        self.slots[slot] = (pm, label)
-        lab = self.slot_labels[slot]
-        lab.setPixmap(pm.scaled(220, 124, Qt.KeepAspectRatio, Qt.SmoothTransformation))
-        lab.setText("")
-        lab.setToolTip(label)
+        self._store_slot(slot, "img", pm, label)
+
+    # —— 渲染：片段 ——
+    def _render_segment(self):
+        if self._busy():
+            return
+        t0 = self._current_t()
+        dur = float(self.seg_dur.currentData())
+        if t0 >= self.info.duration - 0.2:
+            self.setWindowTitle("模块预览 — 当前位置已接近片尾，往回拖一点再渲染")
+            return
+        inst = ModuleInstance(self.inst.key, copy.deepcopy(self.inst.params), True)
+        self._seg_slot_key = self.slot.currentText()
+        self.seg_btn.setEnabled(False)
+        self.render_btn.setEnabled(False)
+        self.seg_btn.setText("渲染中…")
+        self.bar.setVisible(True)
+        self.bar.setRange(0, 0)
+        self._render_thread = RenderSegment(
+            self.src, t0, dur, inst, inst.summary())
+        self._render_thread.progress.connect(self._on_seg_progress)
+        self._render_thread.got.connect(self._on_seg_done)
+        self._render_thread.start()
+
+    def _on_seg_progress(self, done, total):
+        if total:
+            self.bar.setRange(0, total)
+            self.bar.setValue(done)
+
+    def _on_seg_done(self, path: Path | None, label: str):
+        self.seg_btn.setEnabled(True)
+        self.render_btn.setEnabled(True)
+        self.seg_btn.setText("渲染片段")
+        self.bar.setVisible(False)
+        if path is None:
+            self.setWindowTitle(f"模块预览 — 片段渲染失败/取消（{label}）")
+            return
+        thumb = grab_frame(path, 0.0, quality=3)
+        pm = frame_to_pixmap(thumb) if thumb is not None else QPixmap()
+        self._store_slot(self._seg_slot_key, "seg", path, label, pm)
+        self._play_segment(path)
+
+    def _store_slot(self, key: str, kind: str, payload, label: str,
+                    thumb: QPixmap | None = None):
+        self.slots[key] = {"kind": kind, "payload": payload, "label": label}
+        lab = self.slot_labels[key]
+        if thumb is None and kind == "img":
+            thumb = payload
+        if thumb is not None and not thumb.isNull():
+            lab.setPixmap(thumb.scaled(220, 124, Qt.KeepAspectRatio,
+                                       Qt.SmoothTransformation))
+            lab.setText("")
+        else:
+            lab.setText(f"[{key}] ▶ {label[:14]}")
+        tag = "▶" if kind == "seg" else "🖼"
+        lab.setToolTip(f"[{key}] {tag} {label}")
 
     def _show_slot(self, s: str):
-        if s in self.slots:
-            self.view.set_image(self.slots[s][0])
+        entry = self.slots.get(s)
+        if not entry:
+            return
+        if entry["kind"] == "seg":
+            self._play_segment(entry["payload"])
+        else:
+            self.player.stop()
+            self.stack.setCurrentWidget(self.view)
+            self.view.set_image(entry["payload"])
+
+    def _busy(self) -> bool:
+        return bool(self._render_thread and self._render_thread.isRunning())
+
+    def done(self, r):
+        # 关闭时停掉渲染线程（取消片段管线）与播放
+        if isinstance(self._render_thread, RenderSegment):
+            self._render_thread.cancel()
+        if self._render_thread and self._render_thread.isRunning():
+            self._render_thread.wait(5000)
+        self.player.stop()
+        super().done(r)
