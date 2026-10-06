@@ -203,7 +203,12 @@ class PreviewDialog(QDialog):
 
         # 参数面板 + 渲染按钮
         ctl = QHBoxLayout()
-        self.panel = ParamPanel(self.inst)
+        if self.inst.spec.params:
+            self.panel = ParamPanel(self.inst)
+        else:  # 无参模块（去压缩/降噪）：放模块说明，避免左侧一片空白像坏了
+            self.panel = QLabel(self.inst.spec.description)
+            self.panel.setStyleSheet("color:#8a8f98;")
+            self.panel.setWordWrap(True)
         panel_holder = QWidget()
         panel_holder.setLayout(QHBoxLayout())
         panel_holder.layout().setContentsMargins(0, 0, 0, 0)
@@ -221,6 +226,11 @@ class PreviewDialog(QDialog):
 
         # 槽位缩略图条
         slots_row = QHBoxLayout()
+        slots_tip = QLabel("对比槽位：换着参数各渲染一格，点缩略图切换对比")
+        slots_tip.setStyleSheet("color:#8a8f98;font-size:11px;")
+        slots_tip.setAlignment(Qt.AlignVCenter)
+        slots_row.addWidget(slots_tip)
+        slots_row.addSpacing(12)
         self.slot_labels: dict[str, QLabel] = {}
         for s in self.SLOT_KEYS:
             lab = QLabel(f"[{s}] 空")
