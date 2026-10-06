@@ -17,16 +17,17 @@
 
 CrispFrame 的答案：把"模型怎么选、参数怎么配"的知识固化成**零配置默认值**，同时保留专家模式。
 
-## 核心管线
+## 核心管线（快速档定版）
 
 ```
-解码(ffmpeg/PyAV) → 去压缩伪影(deH26x) → 去噪(NAFNet/SCUNet)
-  → 超分(真人 RealESRGAN/4xNomos8k · 动画 AnimeJaNai)
-  → 面部增强(CodeFormer + YuNet 检测，区域修复) → 插帧(RIFE 4.26 / GIMM-VFI) / 防抖(vidstab)
-  → 编码(NVENC AV1 视觉无损 25-35 Mbps)
+解码(ffmpeg) → 去压缩(deH264) → 降噪(SCUNet)
+  → 超分(真人 2xNomosUni · 动漫 AnimeJaNai，2x 到 4K 是速度正解)
+  → GPU 复合后处理(resize 到目标分辨率 + unsharp 锐化 0.6，tone-match 在超分内)
+  → 插帧(RIFE 4.26，可选)
+  → 编码(SVT-AV1 软编 crf30/preset4/MKV，已验证存档工作流；NVENC 仅"草稿"档)
 ```
 
-体积与速度承诺：同样 6GB 1080p 源，4K60 输出约 15-25GB（而非 60GB）；一部 2 小时电影全流程数小时（而非 17 小时）。
+体积与速度承诺：同样 6GB 1080p 源，4K 输出 SVT-AV1 crf30 约 1/8~1/12 体积（硬编会浪费约 6 倍——插帧/超分内容尤甚）；1080p25→4K 快速档 11.75~16.5 帧/s。
 
 ## 质量两档制
 
@@ -64,9 +65,27 @@ v2 预留：人声分离（UVR5/Demucs，开源业界最强）、背景移除（
 
 ## 路线图
 
-- **M1** 命令行管线跑通快速档，出对比样片验收质量与速度 ← 当前阶段
-- **M2** 接入 SeedVR2 极致档，与快速档/UniFab A/B 对比
-- **M3** GUI（PySide6 或本地 Web）：片段预览、队列、专家模式
+- **M1** ✅ 命令行管线跑通快速档（TRT 加速 + 色彩修正 + GPU 后处理，质量与速度验收通过）
+- **M2** ✅ SeedVR2 极致档并入（`--extreme`，~0.2 帧/s，质量代差；面部增强 CodeFormer 已否决——重绘改变五官）
+- **M3** ✅ GUI v2：首页拖入 → 任务页模块链（拖拽排序 + 模块级预览 + A/B/C/D 对比）→ 输出设置抽屉（SVT-AV1 默认 + 配置文件）
+- **二期候选**：轻度剪辑、监视文件夹、人声分离/背景移除
+
+## 快速开始
+
+```bash
+# GUI（推荐）
+.venv/Scripts/python.exe gui.py
+
+# CLI 快速档（真人；动漫加 --content anime）
+python -m crispframe input.mp4 --tone-match --sharpen 0.6 --target-res 3840x2160
+
+# 极致档（SeedVR2，慢但质量代差）
+python -m crispframe input.mp4 --extreme
+```
+
+GUI v2 流程：拖入视频 → 任务页配置 AI 模块链（去压缩/降噪/超分/插帧，可拖拽排序、
+逐模块开关、👁 模块级预览横向选模型）→ ⚙ 输出设置（编码器/CRF/封装，含智能提示与
+配置文件，支持"应用到全部"）→ 开始处理。编码默认 SVT-AV1 软编 crf30/preset4/MKV。
 
 ## 目录结构（规划）
 
