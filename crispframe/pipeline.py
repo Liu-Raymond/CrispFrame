@@ -22,10 +22,18 @@ BatchStage = Callable[[list[Frame]], list[Frame]]
 
 @dataclass
 class EncodeConfig:
+    """旧四字段为 CLI/NVENC 直通路径；GUI 经 codec.build_encode_config_kwargs 填泛化字段。"""
     encoder: str = "av1_nvenc"   # av1_nvenc | hevc_nvenc
     crf: int = 28                # av1: 24-30 感知无损带；hevc 建议 20-24
     preset: str = "p5"           # p1 最快 … p7 最慢质最好
     pix_fmt: str = "yuv420p"
+    # —— 泛化字段（codec.py 生成；args 设置后覆盖上面四项） ——
+    args: list[str] | None = None          # 完整 -c:v 编码参数
+    vf: str | None = None                  # 编码侧 -vf（默认 bt709 转换）
+    decode_vf: list[str] | None = None     # 解码侧滤镜（如 bwdif 反交错）
+    fps_override: float | None = None      # 输出帧率（默认 源×插帧倍率）
+    audio_args: list[str] | None = None    # 默认 ["-c:a","copy"]
+    sub_args: list[str] | None = None      # 默认 []；非空时附带字幕流映射
 
 
 class Interpolator:
@@ -34,9 +42,12 @@ class Interpolator:
         raise NotImplementedError
 
 
-def _decoder_cmd(info: VideoInfo, max_seconds: float | None) -> list[str]:
+def _decoder_cmd(info: VideoInfo, max_seconds: float | None,
+                 extra_vf: list[str] | None = None) -> list[str]:
     cmd = [ffmpeg(), "-nostdin", "-hide_banner", "-loglevel", "error",
            "-i", str(info.path), "-map", "0:v:0"]
+    if extra_vf:
+        cmd += ["-vf", ",".join(extra_vf)]
     if max_seconds:
         cmd += ["-t", f"{max_seconds:.3f}"]
     cmd += ["-f", "rawvideo", "-pix_fmt", "bgr24", "-"]
@@ -46,23 +57,33 @@ def _decoder_cmd(info: VideoInfo, max_seconds: float | None) -> list[str]:
 def _encoder_cmd(info: VideoInfo, out_size: tuple[int, int], out_fps: float,
                  cfg: EncodeConfig, out_path: Path) -> list[str]:
     ow, oh = out_size
-    return [
-        ffmpeg(), "-nostdin", "-hide_banner", "-loglevel", "error", "-y",
-        "-f", "rawvideo", "-pix_fmt", "bgr24", "-s", f"{ow}x{oh}",
-        "-r", f"{out_fps:.6f}", "-i", "-",
-        "-i", str(info.path),
-        "-map", "0:v:0", "-map", "1:a?", "-c:a", "copy",
-        # RGB(bgr24, full)→YUV 转换显式用 bt709/limited（ffmpeg 默认 bt601 会造成色偏），
-        # 并把元数据写入输出，播放器才不会二次误读
-        "-vf", "scale=out_color_matrix=bt709:out_range=tv",
-        "-colorspace", "bt709", "-color_primaries", "bt709", "-color_trc", "bt709",
-        "-color_range", "tv",
+    fps = cfg.fps_override if cfg.fps_override and cfg.fps_override > 0 else out_fps
+    codec_args = cfg.args if cfg.args is not None else [
         "-c:v", cfg.encoder, "-preset", cfg.preset,
         "-rc", "vbr", "-cq", str(cfg.crf), "-b:v", "0",
         "-pix_fmt", cfg.pix_fmt,
-        "-movflags", "+faststart",
-        str(out_path),
     ]
+    vf = cfg.vf or "scale=out_color_matrix=bt709:out_range=tv"
+    audio = cfg.audio_args if cfg.audio_args is not None else ["-c:a", "copy"]
+    subs = cfg.sub_args or []
+    cmd = [
+        ffmpeg(), "-nostdin", "-hide_banner", "-loglevel", "error", "-y",
+        "-f", "rawvideo", "-pix_fmt", "bgr24", "-s", f"{ow}x{oh}",
+        "-r", f"{fps:.6f}", "-i", "-",
+        "-i", str(info.path),
+        "-map", "0:v:0", "-map", "1:a?", *audio, *subs,
+        # RGB(bgr24, full)→YUV 转换显式用 bt709/limited（ffmpeg 默认 bt601 会造成色偏），
+        # 并把元数据写入输出，播放器才不会二次误读
+        "-vf", vf,
+        "-colorspace", "bt709", "-color_primaries", "bt709", "-color_trc", "bt709",
+        "-color_range", "tv",
+        *codec_args,
+    ]
+    # movflags 是 mp4/mov muxer 私有选项，发给 matroska 会直接报错
+    if out_path.suffix.lower() in (".mp4", ".mov"):
+        cmd += ["-movflags", "+faststart"]
+    cmd.append(str(out_path))
+    return cmd
 
 
 def run(
@@ -92,7 +113,7 @@ def run(
         total = info.frames
 
     decoder = subprocess.Popen(
-        _decoder_cmd(info, max_seconds), stdout=subprocess.PIPE,
+        _decoder_cmd(info, max_seconds, encode.decode_vf), stdout=subprocess.PIPE,
         stderr=subprocess.PIPE, bufsize=frame_bytes_in * (batch_size + 2),
     )
     encoder: subprocess.Popen | None = None
