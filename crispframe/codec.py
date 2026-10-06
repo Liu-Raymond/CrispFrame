@@ -16,7 +16,7 @@ _X264_PRESETS = ["ultrafast", "superfast", "veryfast", "faster", "fast",
 
 @dataclass
 class EncoderSpec:
-    key: str                     # ffmpeg -c:v 值 / 设置键
+    key: str                     # 设置键（ENCODERS 字典键 / CodecSettings.encoder）
     name: str                    # GUI 显示名
     draft: bool                  # 草稿档（NVENC）
     crf_range: tuple[int, int]
@@ -27,10 +27,15 @@ class EncoderSpec:
     depths: tuple[int, ...] = (8, 10)
     depth_default: int = 10
     note: str = ""
+    ffcodec: str = ""            # ffmpeg -c:v 值；空 = 同 key（svtav1 → libsvtav1）
 
     def codec_args(self, crf: int, preset: int, depth: int,
                    mode: str = "crf", bitrate_kbps: int = 12000) -> list[str]:
         raise NotImplementedError
+
+    @property
+    def ffmpeg_name(self) -> str:
+        return self.ffcodec or self.key
 
 
 def _pix(depth: int) -> str:
@@ -52,7 +57,7 @@ class _SvtAv1(EncoderSpec):
 class _X26x(EncoderSpec):
     def codec_args(self, crf, preset, depth, mode="crf", bitrate_kbps=12000):
         name = _X264_PRESETS[max(0, min(len(_X264_PRESETS) - 1, int(preset) - 1))]
-        args = ["-c:v", self.key, "-preset", name]
+        args = ["-c:v", self.ffmpeg_name, "-preset", name]
         if mode == "crf":
             args += ["-crf", str(int(crf))]
         else:
@@ -64,7 +69,7 @@ class _X26x(EncoderSpec):
 class _Nvenc(EncoderSpec):
     def codec_args(self, crf, preset, depth, mode="crf", bitrate_kbps=12000):
         # 参考工作流草稿分支：vbr + aq + lookahead
-        args = ["-c:v", self.key, "-preset", f"p{max(1, min(7, int(preset)))}",
+        args = ["-c:v", self.ffmpeg_name, "-preset", f"p{max(1, min(7, int(preset)))}",
                 "-rc", "vbr", "-maxrate", "60M", "-bufsize", "120M",
                 "-spatial-aq", "1", "-temporal-aq", "1", "-rc-lookahead", "32"]
         if mode == "crf":
@@ -76,10 +81,11 @@ class _Nvenc(EncoderSpec):
 
 
 ENCODERS: dict[str, EncoderSpec] = {
-    "svtav1": _SvtAv1("libsvtav1", "SVT-AV1 软编（推荐）", False,
+    "svtav1": _SvtAv1("svtav1", "SVT-AV1 软编（推荐）", False,
                       (0, 63), 30, {25: "稳", 27: "稳", 30: "甜点", 32: "省"},
                       (1, 13), 4, (8, 10), 10,
-                      note="CPU 软编，同画质体积最小；插帧/超分内容尤甚（约 NVENC 的 1/6）"),
+                      "CPU 软编，同画质体积最小；插帧/超分内容尤甚（约 NVENC 的 1/6）",
+                      ffcodec="libsvtav1"),
     "libx265": _X26x("libx265", "x265 软编", False,
                      (0, 51), 20, {}, (1, 10), 6, (8, 10), 10,
                      note="兼容性最好的软编备选"),
