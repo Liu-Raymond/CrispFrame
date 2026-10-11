@@ -52,7 +52,11 @@ class RIFEInterpolator:
         self.use_amp = use_amp and device.startswith("cuda")
         self.amp_dtype = torch.bfloat16  # Blackwell 上 bf16 快且无 fp16 下溢问题
         self.runner = None
-        self.use_trt = use_trt  # engine 延迟到首帧构建（需知道 pad 后 shape）
+        # TRT 对本模型禁用：TensorRT 11.3 执行 ONNX GridSample 的坐标语义与 torch
+        # 不一致（torch align_corners=True 的 backwarp 被错误采样），输出水平撕裂
+        # （2026-10-11 排查：torch/ONNX/ORT 三方一致正确，仅 TRT 错；fp16/fp32、
+        # 新旧引擎均复现）。SR 模型不受影响。待 TRT 修复后可重新启用。
+        self.use_trt = False
 
     def _trt_engine(self, h: int, w: int):
         import tensorrt as _trt  # noqa: N813
@@ -75,7 +79,9 @@ class RIFEInterpolator:
     def _to_tensor(self, bgr: np.ndarray):
         # uint8 HWC BGR 直接上卡，BGR→RGB/归一化/pad 全在 GPU 做（省 CPU 3x24MB 拷贝）
         t = torch.from_numpy(bgr).to(self.device)
-        t = t.permute(2, 0, 1).flip(0).float().div_(255.0)
+        # unsqueeze(0)：补 batch 维。缺了它张量是 3D（两帧会沿高度拼接、ts 形状错乱），
+        # TRT 对 shape 不匹配只打日志不报错、静默输出全零帧（表现为插帧一黑一正常闪屏）
+        t = t.unsqueeze(0).permute(0, 3, 1, 2).flip(1).float().div_(255.0)
         h, w = t.shape[-2:]
         ph = (self.pad_div - h % self.pad_div) % self.pad_div
         pw = (self.pad_div - w % self.pad_div) % self.pad_div

@@ -103,6 +103,10 @@ class TrtRunner:
     def __call__(self, inputs: list[torch.Tensor]) -> list[torch.Tensor]:
         cur = torch.cuda.current_stream()
         self.stream.wait_stream(cur)  # 等输入张量在当前流上就绪
+        # 跨流标记：输入在当前流分配、专用流消费；不标记的话分配器可能在
+        # 专用流仍在读时把内存复用给后续分配（当前同步模式下是保险，异步化后是必需）
+        for t in inputs:
+            t.record_stream(self.stream)
         with torch.cuda.stream(self.stream):
             for name, t in zip(self.input_names, inputs):
                 self.context.set_input_shape(name, tuple(t.shape))
@@ -111,6 +115,7 @@ class TrtRunner:
             for name in self.output_names:
                 shape = tuple(self.context.get_tensor_shape(name))
                 out = torch.empty(shape, dtype=torch.float32, device="cuda")
+                out.record_stream(cur)  # 输出在专用流产出、当前流消费
                 self.context.set_tensor_address(name, out.data_ptr())
                 outputs.append(out)
             ok = self.context.execute_async_v3(self.stream.cuda_stream)
