@@ -34,11 +34,8 @@ BUILTIN: dict[str, ModelSpec] = {
     "deh264": ModelSpec("deh264", PRETRAINED_DIR / "deH264_SuperUltraCompact.safetensors", 1, "dedeblur", "real"),
     # 去噪 1x（超分前置）
     "scunet": ModelSpec("scunet", PRETRAINED_DIR / "scunet_color_real_psnr.pth", 1, "denoise", "real"),
-    # SCUNet GAN 变体：更锐、细节多但可能放大噪声。权重非公开直链，用户手动放入
-    # models/pretrained 后 available()/下拉自动出现
-    "scunet-gan": ModelSpec("scunet-gan", PRETRAINED_DIR / "scunet_color_real_gan.pth", 1, "denoise", "real"),
     # NAFNet SIDD width64：官方真实照片降噪参考模型（SIDD 基准）。spandrel 主库原生支持。
-    "nafnet-sidd": ModelSpec("nafnet-sidd", PRETRAINED_DIR / "NAFNet-SIDD-width64.pth", 1, "denoise", "real"),
+    "nafnet-sidd": ModelSpec("nafnet-sidd", PRETRAINED_DIR / "NAFNet-SIDD-width32.pth", 1, "denoise", "real"),
 }
 
 

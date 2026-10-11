@@ -161,20 +161,19 @@ class _Deh264Spec(ModuleSpec):
 
 class _DenoiseSpec(ModuleSpec):
     def __init__(self):
-        # 降噪模型下拉按磁盘文件自动出现：GAN 变体（更锐、细节多但可能放大噪声）
-        # 权重无公开直链，放入 models/pretrained/scunet_color_real_gan.pth 即可选
+        # 降噪模型下拉按磁盘文件自动出现。GAN 变体经 A/B 目测与 PSNR 无可见
+        # 差异且慢 2.5 倍（8s vs 3.2s/帧 @4K）已移除；如需找回：
+        # huggingface.co/krnl/ScuNET/resolve/main/scunet_color_real_gan.pth (72MB)
         choices = [("SCUNet PSNR（保守·干净）", "scunet")]
-        if (registry.PRETRAINED_DIR / "scunet_color_real_gan.pth").exists():
-            choices.append(("SCUNet GAN（锐·细节多）", "scunet-gan"))
-        if (registry.PRETRAINED_DIR / "NAFNet-SIDD-width64.pth").exists():
-            choices.append(("NAFNet SIDD（参考级·慢）", "nafnet-sidd"))
+        if (registry.PRETRAINED_DIR / "NAFNet-SIDD-width32.pth").exists():
+            choices.append(("NAFNet SIDD 32（轻量·4K 可用）", "nafnet-sidd"))
         super().__init__(
             key="denoise", name="降噪",
             description="去除传感器/胶片噪点（SCUNet），建议放在超分之前",
             order=1,
             params=[
                 ParamSpec("model", "模型", "choice", "scunet", choices,
-                          tip="PSNR 保守干净；GAN 更锐但可能把噪声当细节放大"),
+                          tip="PSNR 保守干净，去噪同时轻微增强细节"),
                 ParamSpec("strength", "强度", "float", 1.0,
                           min=0.0, max=1.0, step=0.05,
                           tip="1.0 = 完全 AI 降噪；调低 = 与原帧混合，保细节更保守"),
@@ -189,22 +188,21 @@ class _DenoiseSpec(ModuleSpec):
 
     def summary(self, params: dict, src_h: int = 0) -> str:
         a = float(params.get("strength", 1.0))
-        names = {"scunet-gan": "SCUNet GAN", "nafnet-sidd": "NAFNet SIDD"}
+        names = {"nafnet-sidd": "NAFNet SIDD 32"}
         model = names.get(params.get("model"), "SCUNet")
         tail = f" · 强度{a:.0%}" if a < 0.995 else ""
         return f"{model} 去噪{tail}"
 
 
 # 超分模型选项：第一项 auto = 按 内容类型 + 目标高度/源高度 自动选（元组 = (显示, 值)）
+# 模型经同帧 A/B（画质目测 + 速度 + 显存）筛选：无可辨差异的 UltraSharp/RealESRGAN
+# （慢 60 倍/显存 4 倍）与 ClearReality（与 Nomos8k-weak 定位重叠）已移除出下拉；
+# registry 条目保留供 CLI 高级用法，权重文件留在磁盘可随时恢复
 _SR_MODEL_CHOICES = [
     ("自动（按目标分辨率选）", "auto"),
     ("NomosUni 2x（真人）", "nomosuni"),
     ("AnimeJaNai 2x（动漫）", "anime"),
     ("Nomos8k 4x（弱去噪·真人）", "nomos8k-weak"),
-    ("ClearReality 4x", "clearreality"),
-    ("UltraSharp 4x", "ultrasharp"),
-    ("Nomos8k 4x（强去噪）", "nomos8k"),
-    ("RealESRGAN 4x", "x4plus"),
 ]
 _SR_DISPLAY = {v: d for d, v in _SR_MODEL_CHOICES}
 
