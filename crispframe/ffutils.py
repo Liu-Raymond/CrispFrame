@@ -4,6 +4,7 @@ import json
 import os
 import shutil
 import subprocess
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -12,15 +13,24 @@ _WINGET_GLOB = os.path.join(
     "Microsoft", "WinGet", "Packages", "Gyan.FFmpeg*",
 )
 
+_EXE_CACHE: dict[str, str] = {}
+
 
 def _find_exe(name: str) -> str:
-    p = shutil.which(name)
+    p = _EXE_CACHE.get(name)
     if p:
         return p
-    hits = glob.glob(os.path.join(_WINGET_GLOB, "**", "bin", name + ".exe"), recursive=True)
-    if hits:
-        return hits[0]
-    raise FileNotFoundError(f"{name} not found; install with: winget install --id Gyan.FFmpeg -e")
+    p = shutil.which(name)
+    if not p:
+        hits = glob.glob(os.path.join(_WINGET_GLOB, "**", "bin", name + ".exe"),
+                         recursive=True)
+        if hits:
+            p = hits[0]
+    if not p:
+        raise FileNotFoundError(
+            f"{name} not found; install with: winget install --id Gyan.FFmpeg -e")
+    _EXE_CACHE[name] = p
+    return p
 
 
 def ffmpeg() -> str:
@@ -29,6 +39,12 @@ def ffmpeg() -> str:
 
 def ffprobe() -> str:
     return _find_exe("ffprobe")
+
+
+# GUI（pythonw 无控制台）spawn ffmpeg/ffprobe 时抑制黑框闪烁；
+# POSIX 上为空 dict（CREATE_NO_WINDOW 是 Windows 专属参数）
+SUBPROC_FLAGS = ({"creationflags": subprocess.CREATE_NO_WINDOW}
+                 if sys.platform == "win32" else {})
 
 
 @dataclass
@@ -53,7 +69,7 @@ def probe(path: str | Path) -> VideoInfo:
          "-show_entries", "stream=width,height,r_frame_rate,avg_frame_rate,nb_frames",
          "-show_entries", "format=duration",
          "-of", "json", str(path)],
-        capture_output=True, text=True, check=True,
+        capture_output=True, text=True, check=True, **SUBPROC_FLAGS,
     ).stdout
     data = json.loads(out)
     st = data["streams"][0]

@@ -14,7 +14,7 @@ from typing import Callable
 import numpy as np
 from tqdm import tqdm
 
-from .ffutils import VideoInfo, ffmpeg, probe
+from .ffutils import VideoInfo, ffmpeg, probe, SUBPROC_FLAGS
 
 Frame = np.ndarray  # HxWx3 uint8 BGR
 BatchStage = Callable[[list[Frame]], list[Frame]]
@@ -123,6 +123,7 @@ def run(
         _decoder_cmd(info, max_seconds, encode.decode_vf, start),
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE, bufsize=frame_bytes_in * (batch_size + 2),
+        **SUBPROC_FLAGS,
     )
     encoder: subprocess.Popen | None = None
     enc_err_holder: list[str] = []
@@ -138,6 +139,7 @@ def run(
         encoder = subprocess.Popen(
             _encoder_cmd(info, (ow, oh), out_fps, encode, out_path),
             stdin=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=ow * oh * 3 * 2,
+            **SUBPROC_FLAGS,
         )
 
     def write_out(frame: Frame):

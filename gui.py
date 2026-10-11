@@ -7,12 +7,18 @@
 from __future__ import annotations
 
 import copy
+import os
 import sys
+import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from PySide6.QtCore import Qt, QThread, Signal
+# Qt Multimedia 的 ffmpeg 后端默认禁用硬解（4K 双流软解跟不上实时 → 对比卡顿）。
+# d3d11va 在 Windows/NVIDIA 上稳定；不支持的机器会自动回退软解。
+os.environ.setdefault("QT_FFMPEG_DECODING_HW_DEVICE_TYPES", "d3d11va")
+
+from PySide6.QtCore import Qt, QThread, QTimer, Signal
 from PySide6.QtWidgets import (
     QApplication, QCheckBox, QComboBox, QDialog, QDoubleSpinBox, QFileDialog,
     QFrame, QGridLayout, QHBoxLayout, QLabel, QLineEdit, QListWidget,
@@ -38,6 +44,8 @@ QPushButton { background:#2f3136; border:1px solid #3f4147; border-radius:6px;
               padding:6px 12px; }
 QPushButton:hover { background:#3a3c42; }
 QPushButton:disabled { color:#6a6c72; }
+QPushButton:checked { background:#2563eb; border-color:#3b82f6; color:#ffffff; }
+QPushButton:checked:hover { background:#1d4fd7; }
 QPushButton#startBtn { background:#3b82f6; border:none; font-weight:bold; padding:10px; }
 QPushButton#startBtn:hover { background:#2f6fe0; }
 QPushButton#startBtn:disabled { background:#2a3a55; color:#7d8ba1; }
@@ -66,7 +74,7 @@ QTabBar::tab:selected { background:#2f3136; color:#fff; }
 
 # ---------------------------------------------------------------- 任务模型
 
-@dataclass
+@dataclass(eq=False)
 class Task:
     src: Path
     info: VideoInfo
@@ -79,6 +87,8 @@ class Task:
         if not self.modules:
             content = "anime" if _looks_anime(self.info) else "real"
             self.modules = modules.default_chain(content)
+        for m in self.modules:
+            m.src_h = self.info.height
         if self.out_dir is None:
             self.out_dir = self.src.parent
 
@@ -90,7 +100,7 @@ class Task:
         return self.out_dir / f"{self.src.stem}.cf.{tags}{self.codec_settings.ext()}"
 
     def out_size(self) -> tuple[int, int]:
-        """输出分辨率：按启用的超分模块推算（无则源分辨率/自定义）。"""
+        """输出分辨率：超分模块的目标分辨率决定；与源相同则保持源分辨率。"""
         cs = self.codec_settings
         if cs.res_mode == "custom":
             w, _, h = (cs.res_custom or "").lower().partition("x")
@@ -102,8 +112,7 @@ class Task:
                 if target:
                     w, _, h = target.partition("x")
                     return int(w), int(h)
-                spec = modules.registry.resolve(m.params["model"])
-                return self.info.width * spec.scale, self.info.height * spec.scale
+                return self.info.width, self.info.height
         return self.info.width, self.info.height
 
     def out_fps_value(self) -> float:
@@ -117,6 +126,22 @@ def _looks_anime(info: VideoInfo) -> bool:
 
 
 # ---------------------------------------------------------------- Worker
+
+class ProbeWorker(QThread):
+    """后台逐个探测视频：不阻塞 UI（否则添加多个文件时界面冻结数秒）。"""
+    probed = Signal(str, object, str)   # path, Task | None, error message
+
+    def __init__(self, paths: list[Path]):
+        super().__init__()
+        self.paths = paths
+
+    def run(self):
+        for p in self.paths:
+            try:
+                self.probed.emit(str(p), Task(src=p, info=probe(p)), "")
+            except Exception as e:  # noqa: BLE001
+                self.probed.emit(str(p), None, f"{p.name}: 无法读取（{e}）")
+
 
 class Worker(QThread):
     taskProgress = Signal(str, int, int)   # 任务名, done, total
@@ -249,6 +274,7 @@ class ModuleRow(QFrame):
     def _open_config(self):
         work = ModuleInstance(self.inst.key, copy.deepcopy(self.inst.params),
                               self.inst.enabled)
+        work.src_h = self.inst.src_h
         dlg = ModuleParamDialog(work, self.window())
         if dlg.exec() == QDialog.Accepted:
             self.inst.params = work.params
@@ -355,6 +381,7 @@ class ModuleChainList(QWidget):
         if not self.task:
             return
         inst = ModuleInstance(key)
+        inst.src_h = self.task.info.height
         # 保持默认链序插入
         self.task.modules.append(inst)
         self.task.modules.sort(key=lambda m: m.spec.order)
@@ -658,6 +685,8 @@ class OutputSettingsDialog(QDialog):
         if prof.modules:
             self.task.modules = [ModuleInstance(m.key, dict(m.params), m.enabled)
                                  for m in prof.modules]
+            for m in self.task.modules:
+                m.src_h = self.task.info.height
         self.encoder.blockSignals(True)
         self.encoder.setCurrentIndex(max(0, list(codec.ENCODERS).index(self.cs.encoder)))
         self.encoder.blockSignals(False)
@@ -760,6 +789,8 @@ class TaskPage(QWidget):
         self.tasks: list[Task] = []
         self.current: Task | None = None
         self._building = False
+        self._probe_workers: list[ProbeWorker] = []
+        self._probing_paths: set[Path] = set()
 
         v = QVBoxLayout(self)
         split = QSplitter(Qt.Horizontal)
@@ -837,19 +868,32 @@ class TaskPage(QWidget):
 
     # —— 任务管理 ——
     def add_tasks(self, paths: list[Path]) -> int:
-        n = 0
-        for p in paths:
-            if any(t.src == p for t in self.tasks):
-                continue
-            try:
-                info = probe(p)
-            except Exception as e:  # noqa: BLE001
-                self.log_box.append(f"[跳过] {p.name}: 无法读取（{e}）")
-                continue
-            self.tasks.append(Task(src=p, info=info))
-            n += 1
-        self.refresh_task_list()
-        return n
+        """入队即返回：探测在 ProbeWorker 后台做，结果逐个回填 UI。"""
+        probing = getattr(self, "_probing_paths", set())
+        new = [p for p in paths
+               if p not in probing and not any(t.src == p for t in self.tasks)]
+        if not new:
+            return 0
+        self._probing_paths = probing | set(new)
+        self._probe_workers.append(ProbeWorker(new))
+        w = self._probe_workers[-1]
+        w.probed.connect(self._on_probed)
+        w.finished.connect(lambda: self._probe_workers.remove(w)
+                           if w in self._probe_workers else None)
+        w.start()
+        return len(new)
+
+    def _on_probed(self, path_str: str, task: Task | None, err: str):
+        self._probing_paths.discard(Path(path_str))
+        if err:
+            self.log_box.append(f"[跳过] {err}")
+        else:
+            task.status = "就绪"
+            self.tasks.append(task)
+            if self.current is None:
+                self.show_task(task)          # 首个任务探测完自动展示
+            else:
+                self.refresh_task_list()
 
     def refresh_task_list(self):
         self.task_list.blockSignals(True)
@@ -909,7 +953,12 @@ class TaskPage(QWidget):
         from gui_preview import PreviewDialog
         if not self.current:
             return
-        dlg = PreviewDialog(self.current.src, inst, self)
+        QApplication.setOverrideCursor(Qt.WaitCursor)
+        try:
+            dlg = PreviewDialog(self.current.src, inst, self,
+                                info=self.current.info)
+        finally:
+            QApplication.restoreOverrideCursor()
         dlg.exec()
 
     def _open_settings(self):
@@ -958,18 +1007,27 @@ class MainWindow(QMainWindow):
             lambda: self.stack.setCurrentWidget(self.home))
         self.task_page.startRequested.connect(self._start)
         self.task_page.stop_btn.clicked.connect(self._stop)
+        QTimer.singleShot(400, self._preload_preview_modules)
 
     def _go_tasks(self):
         paths = self.home.paths()
         if not paths:
             return
-        n = self.task_page.add_tasks(paths)
+        n = self.task_page.add_tasks(paths)   # 异步探测，立即返回
         self.home._clear()
-        if self.task_page.current is None and self.task_page.tasks:
-            self.task_page.show_task(self.task_page.tasks[0])
         self.stack.setCurrentWidget(self.task_page)
         if n:
-            self.task_page.log(f"已添加 {n} 个任务")
+            self.task_page.log(f"正在读取 {n} 个文件…")
+
+    def _preload_preview_modules(self):
+        """后台预载预览对话框的重依赖（cv2/QtMultimedia）：
+        不做的话第一次点「预览」会在 UI 线程 import，卡数秒。"""
+        def work():
+            try:
+                import gui_preview  # noqa: F401
+            except Exception:  # noqa: BLE001
+                pass
+        threading.Thread(target=work, daemon=True, name="cf-preload").start()
 
     def _start(self):
         if self.worker or not self.task_page.tasks:
