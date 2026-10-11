@@ -16,13 +16,13 @@ def _thumb(src: Path, info: VideoInfo) -> QPixmap:
     """抽首帧作缩略图（失败返回空 pixmap）。"""
     import subprocess
 
-    from crispframe.ffutils import ffmpeg
+    from crispframe.ffutils import SUBPROC_FLAGS, ffmpeg
     tmp = Path(src).with_suffix(".cfthumb.jpg")
     try:
         subprocess.run(
             [ffmpeg(), "-nostdin", "-y", "-ss", "1", "-i", str(src),
              "-frames:v", "1", "-q:v", "4", str(tmp)],
-            capture_output=True, timeout=20)
+            capture_output=True, timeout=20, **SUBPROC_FLAGS)
         pm = QPixmap(str(tmp))
         tmp.unlink(missing_ok=True)
         return pm

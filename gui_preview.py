@@ -27,7 +27,7 @@ from PySide6.QtWidgets import (
     QVBoxLayout, QWidget,
 )
 
-from crispframe.ffutils import VideoInfo, ffmpeg, probe
+from crispframe.ffutils import VideoInfo, SUBPROC_FLAGS, ffmpeg, probe
 from crispframe.modules import BuildContext, ModuleInstance
 from crispframe.pipeline import EncodeConfig, run as pipeline_run
 
@@ -39,13 +39,20 @@ def frame_to_pixmap(bgr: np.ndarray) -> QPixmap:
     return QPixmap.fromImage(img)
 
 
-def grab_frame(src: Path, t: float, quality: int = 2) -> np.ndarray | None:
-    tmp = Path(tempfile.gettempdir()) / f"cf_prev_{t:.3f}.jpg"
+def grab_frame(src: Path, t: float, quality: int = 2,
+               max_width: int = 0) -> np.ndarray | None:
+    """抽一帧。max_width>0 时降采样到该宽度以内（只缩不放大）——
+    时间轴浏览用，4K 源全分辨率抽帧 ~300ms/帧，降采样后快数倍；
+    喂模型/像素级对比的场景不要传（保持全分辨率）。
+    max_width 进临时文件名，避免同秒并发抽帧（浏览 vs 渲染）写同名文件互踩。"""
+    tmp = Path(tempfile.gettempdir()) / f"cf_prev_{t:.3f}_{max_width}.jpg"
     try:
-        subprocess.run(
-            [ffmpeg(), "-nostdin", "-y", "-ss", f"{t:.3f}", "-i", str(src),
-             "-frames:v", "1", "-q:v", str(quality), str(tmp)],
-            capture_output=True, timeout=25)
+        cmd = [ffmpeg(), "-nostdin", "-y", "-ss", f"{t:.3f}", "-i", str(src),
+               "-frames:v", "1"]
+        if max_width:
+            cmd += ["-vf", f"scale={max_width}:{max_width}:force_original_aspect_ratio=decrease"]
+        cmd += ["-q:v", str(quality), str(tmp)]
+        subprocess.run(cmd, capture_output=True, timeout=25, **SUBPROC_FLAGS)
         img = cv2.imread(str(tmp))
         return img
     finally:
@@ -53,7 +60,7 @@ def grab_frame(src: Path, t: float, quality: int = 2) -> np.ndarray | None:
 
 
 class SeekThumb(QThread):
-    """后台 ffmpeg seek 抽帧。"""
+    """后台 ffmpeg seek 抽帧（时间轴浏览用，降采样提速）。"""
     got = Signal(object)  # np.ndarray BGR
 
     def __init__(self, src: Path, t: float):
@@ -61,7 +68,7 @@ class SeekThumb(QThread):
         self.src, self.t = src, t
 
     def run(self):
-        img = grab_frame(self.src, self.t, quality=3)
+        img = grab_frame(self.src, self.t, quality=3, max_width=1920)
         if img is not None:
             self.got.emit(img)
 
@@ -70,13 +77,15 @@ class RenderModule(QThread):
     """后台渲染单帧：当前帧只过目标模块。插帧模块取相邻两帧做真实 midframe。"""
     got = Signal(object, str)  # np.ndarray | None, message
 
-    def __init__(self, src: Path, t: float, inst: ModuleInstance, label: str):
+    def __init__(self, src: Path, t: float, inst: ModuleInstance, label: str,
+                 info: VideoInfo | None = None):
         super().__init__()
         self.src, self.t, self.inst, self.label = src, t, inst, label
+        self.info = info
 
     def run(self):
         try:
-            info: VideoInfo = probe(self.src)
+            info = self.info or probe(self.src)
             ctx = BuildContext(width=info.width, height=info.height, fps=info.fps)
             built = self.inst.spec.build(self.inst.params, ctx)
             if built.interpolator is not None:
@@ -105,11 +114,12 @@ class RenderSegment(QThread):
     got = Signal(object, str)
 
     def __init__(self, src: Path, start: float, duration: float,
-                 inst: ModuleInstance, label: str):
+                 inst: ModuleInstance, label: str, info: VideoInfo | None = None):
         super().__init__()
         # 注意不能叫 self.start——会覆盖 QThread.start() 方法
         self.src, self.t0, self.dur = src, start, duration
         self.inst, self.label = inst, label
+        self.info = info
         self._cancel = False
 
     def cancel(self):
@@ -118,7 +128,7 @@ class RenderSegment(QThread):
     def run(self):
         out = Path(tempfile.gettempdir()) / f"cf_seg_{int(time.time() * 1000)}.mp4"
         try:
-            info: VideoInfo = probe(self.src)
+            info = self.info or probe(self.src)
             ctx = BuildContext(width=info.width, height=info.height, fps=info.fps)
             built = self.inst.spec.build(self.inst.params, ctx)
             encode = EncodeConfig(
@@ -132,7 +142,11 @@ class RenderSegment(QThread):
                 max_seconds=self.dur,
                 progress_callback=lambda d, t: self.progress.emit(d, t),
                 cancel_check=lambda: self._cancel)
-            self.got.emit(out if stats["frames_out"] > 0 else None, self.label)
+            if stats["frames_out"] > 0:
+                self.got.emit(out, self.label)
+            else:                       # 零帧产物一并清掉
+                out.unlink(missing_ok=True)
+                self.got.emit(None, self.label)
         except Exception as e:  # noqa: BLE001
             out.unlink(missing_ok=True)
             self.got.emit(None, f"{self.label}（失败: {e}）")
@@ -226,19 +240,22 @@ class ParamPanel(QWidget):
 class PreviewDialog(QDialog):
     """模块预览：选段/单帧渲染 + 内嵌播放 + 参数面板 + 4 槽位对比。"""
 
-    SLOT_KEYS = ["A", "B", "C", "D"]
+    ORIG_KEY = "orig"                # 原片槽：固定第一位，不占字母
+    RENDER_SLOTS = ["A", "B", "C"]   # 渲染位，顺延编号
     SEG_DURATIONS = [("5 秒", 5.0), ("10 秒", 10.0), ("15 秒", 15.0),
                      ("20 秒", 20.0), ("30 秒", 30.0)]
 
-    def __init__(self, src: Path, inst: ModuleInstance, parent=None):
+    def __init__(self, src: Path, inst: ModuleInstance, parent=None,
+                 info: VideoInfo | None = None):
         super().__init__(parent)
         self.src = src
         self.inst = inst                      # 工作副本（面板直接改它）
-        self.info: VideoInfo = probe(src)
+        self.info = info or probe(src)        # 复用任务已探测的 info，省一次 ffprobe
         self.setWindowTitle(f"模块预览 — {inst.spec.name} · {src.name}")
         self.resize(1280, 760)
         self._render_thread: QThread | None = None
         self._thumb_thread: SeekThumb | None = None
+        self._pending_t: float | None = None
         self._seg_slot_key = "A"
         self.slots: dict[str, dict] = {}      # key -> {kind: img|seg, payload, label}
 
@@ -284,28 +301,34 @@ class PreviewDialog(QDialog):
         ctl.addWidget(self.seg_btn)
 
         self.slot = QComboBox()
-        self.slot.addItems(self.SLOT_KEYS)
+        self.slot.addItems(self.RENDER_SLOTS)     # 渲染结果存 B/C/D；A 固定为原片
         ctl.addWidget(QLabel("存入槽位"))
         ctl.addWidget(self.slot)
         self.render_btn = QPushButton("渲染此帧")
         self.render_btn.setToolTip("只渲染当前这一帧（静态对比，最快）")
         self.render_btn.clicked.connect(self._render_current)
         ctl.addWidget(self.render_btn)
+        self.compare_btn = QPushButton("🔍 对比")
+        self.compare_btn.setToolTip("两路画面全屏对比：擦除叠加 / 左右并排 / 细节缩放")
+        self.compare_btn.setEnabled(False)        # 至少有一个渲染结果后可用
+        self.compare_btn.clicked.connect(self._open_compare)
+        ctl.addWidget(self.compare_btn)
         root.addLayout(ctl)
 
         self.bar = QProgressBar()
         self.bar.setVisible(False)
         root.addWidget(self.bar)
 
-        # 槽位缩略图条
+        # 槽位缩略图条（原片 + A/B/C 渲染位）
         slots_row = QHBoxLayout()
         slots_tip = QLabel("对比槽位：换着参数各渲染一段/一帧，点缩略图切换对比")
         slots_tip.setStyleSheet("color:#8a8f98;font-size:11px;")
         slots_row.addWidget(slots_tip)
         slots_row.addSpacing(12)
         self.slot_labels: dict[str, QLabel] = {}
-        for s in self.SLOT_KEYS:
-            lab = QLabel(f"[{s}] 空")
+        for s in [self.ORIG_KEY] + self.RENDER_SLOTS:
+            init = "[原片]" if s == self.ORIG_KEY else f"[{s}] 空"
+            lab = QLabel(init)
             lab.setFixedSize(220, 124)
             lab.setAlignment(Qt.AlignCenter)
             lab.setStyleSheet(
@@ -338,14 +361,34 @@ class PreviewDialog(QDialog):
         self._show_original_at(t)
 
     def _show_original_at(self, t: float):
+        # 拖动节流：抽帧进行中只记录最新位置，线程结束后补一次（最新优先）
+        self._pending_t = t
         if self._thumb_thread and self._thumb_thread.isRunning():
+            return
+        self._drain_pending()
+
+    def _drain_pending(self):
+        t = self._pending_t
+        self._pending_t = None
+        if t is None:
             return
         self._thumb_thread = SeekThumb(self.src, t)
         self._thumb_thread.got.connect(self._set_original)
+        self._thumb_thread.finished.connect(self._drain_pending)
         self._thumb_thread.start()
 
     def _set_original(self, img: np.ndarray):
         self.view.set_image(frame_to_pixmap(img))
+        # 原片槽固定显示缩略图（对比器的"原片"位）
+        pm = frame_to_pixmap(img)
+        self.slots.setdefault(self.ORIG_KEY, {"kind": "img", "payload": pm,
+                                              "label": "原片", "t0": 0.0, "dur": 0.0})
+        self.slots[self.ORIG_KEY]["payload"] = pm
+        self.slots[self.ORIG_KEY]["t0"] = self._current_t()
+        lab = self.slot_labels[self.ORIG_KEY]
+        lab.setPixmap(pm.scaled(220, 124, Qt.KeepAspectRatio, Qt.SmoothTransformation))
+        lab.setText("")
+        lab.setToolTip("原片（未增强）")
 
     def _current_t(self) -> float:
         return self.slider.value() / 10
@@ -369,8 +412,9 @@ class PreviewDialog(QDialog):
         self.render_btn.setEnabled(False)
         self.render_btn.setText("渲染中…")
         inst = ModuleInstance(self.inst.key, copy.deepcopy(self.inst.params), True)
+        inst.src_h = self.inst.src_h
         self._render_thread = RenderModule(
-            self.src, self._current_t(), inst, inst.summary())
+            self.src, self._current_t(), inst, inst.summary(), info=self.info)
         self._render_thread.got.connect(self._on_rendered)
         self._render_thread.start()
 
@@ -384,7 +428,7 @@ class PreviewDialog(QDialog):
         pm = frame_to_pixmap(img)
         self.stack.setCurrentWidget(self.view)
         self.view.set_image(pm)
-        self._store_slot(slot, "img", pm, label)
+        self._store_slot(slot, "img", pm, label, t0=self._current_t())
 
     # —— 渲染：片段 ——
     def _render_segment(self):
@@ -395,7 +439,9 @@ class PreviewDialog(QDialog):
         if t0 >= self.info.duration - 0.2:
             self.setWindowTitle("模块预览 — 当前位置已接近片尾，往回拖一点再渲染")
             return
+        self._seg_t0, self._seg_dur = t0, dur
         inst = ModuleInstance(self.inst.key, copy.deepcopy(self.inst.params), True)
+        inst.src_h = self.inst.src_h
         self._seg_slot_key = self.slot.currentText()
         self.seg_btn.setEnabled(False)
         self.render_btn.setEnabled(False)
@@ -403,7 +449,7 @@ class PreviewDialog(QDialog):
         self.bar.setVisible(True)
         self.bar.setRange(0, 0)
         self._render_thread = RenderSegment(
-            self.src, t0, dur, inst, inst.summary())
+            self.src, t0, dur, inst, inst.summary(), info=self.info)
         self._render_thread.progress.connect(self._on_seg_progress)
         self._render_thread.got.connect(self._on_seg_done)
         self._render_thread.start()
@@ -421,14 +467,17 @@ class PreviewDialog(QDialog):
         if path is None:
             self.setWindowTitle(f"模块预览 — 片段渲染失败/取消（{label}）")
             return
-        thumb = grab_frame(path, 0.0, quality=3)
+        thumb = grab_frame(path, 0.0, quality=3, max_width=640)
         pm = frame_to_pixmap(thumb) if thumb is not None else QPixmap()
-        self._store_slot(self._seg_slot_key, "seg", path, label, pm)
+        self._store_slot(self._seg_slot_key, "seg", path, label,
+                         t0=self._seg_t0, dur=self._seg_dur, thumb=pm)
         self._play_segment(path)
 
     def _store_slot(self, key: str, kind: str, payload, label: str,
+                    t0: float = 0.0, dur: float = 0.0,
                     thumb: QPixmap | None = None):
-        self.slots[key] = {"kind": kind, "payload": payload, "label": label}
+        self.slots[key] = {"kind": kind, "payload": payload, "label": label,
+                           "t0": t0, "dur": dur}
         lab = self.slot_labels[key]
         if thumb is None and kind == "img":
             thumb = payload
@@ -440,8 +489,17 @@ class PreviewDialog(QDialog):
             lab.setText(f"[{key}] ▶ {label[:14]}")
         tag = "▶" if kind == "seg" else "🖼"
         lab.setToolTip(f"[{key}] {tag} {label}")
+        if key in self.RENDER_SLOTS:
+            self.last_render_key = key          # 对比器默认选它
+        self.compare_btn.setEnabled(           # A=原片之外至少有一个渲染结果
+            any(k in self.slots for k in self.RENDER_SLOTS))
 
     def _show_slot(self, s: str):
+        if s == self.ORIG_KEY:   # 原片位：回到当前时间点的源画面
+            self.player.stop()
+            self.stack.setCurrentWidget(self.view)
+            self._show_original_at(self._current_t())
+            return
         entry = self.slots.get(s)
         if not entry:
             return
@@ -452,6 +510,14 @@ class PreviewDialog(QDialog):
             self.stack.setCurrentWidget(self.view)
             self.view.set_image(entry["payload"])
 
+    def _open_compare(self):
+        if not any(k in self.slots for k in self.RENDER_SLOTS):
+            self.setWindowTitle("模块预览 — 先渲染一个结果才能对比")
+            return
+        from compare_view import CompareDialog
+        dlg = CompareDialog(self)
+        dlg.exec()
+
     def _busy(self) -> bool:
         return bool(self._render_thread and self._render_thread.isRunning())
 
@@ -461,5 +527,22 @@ class PreviewDialog(QDialog):
             self._render_thread.cancel()
         if self._render_thread and self._render_thread.isRunning():
             self._render_thread.wait(5000)
+        self._pending_t = None
+        if self._thumb_thread and self._thumb_thread.isRunning():
+            self._thumb_thread.wait(3000)
         self.player.stop()
+        self._cleanup_temp_segments()
         super().done(r)
+
+    def _cleanup_temp_segments(self):
+        """删除预览产生的临时片段（只动系统临时目录里 cf_seg_ 前缀的自己的文件）。"""
+        tmp = Path(tempfile.gettempdir())
+        for entry in self.slots.values():
+            if entry.get("kind") != "seg":
+                continue
+            try:
+                p = Path(entry["payload"])
+                if p.is_relative_to(tmp) and p.name.startswith("cf_seg_"):
+                    p.unlink(missing_ok=True)
+            except (OSError, ValueError, TypeError):
+                pass
