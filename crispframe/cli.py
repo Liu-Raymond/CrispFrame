@@ -12,6 +12,7 @@ import time
 from pathlib import Path
 
 from . import registry
+from .modules import StrengthBlend
 from .ffutils import probe
 from .pipeline import EncodeConfig, run
 from .gpu_post import GpuPost
@@ -38,16 +39,18 @@ def build_stages(args, info) -> list:
             name = "anime" if args.content == "anime" else "nomos8k"
         return registry.resolve(name)
 
-    if args.deh264:
+    if args.deh264 and args.deh264 > 0.005:   # 与 GUI build 的 ≤0.005 短路语义一致
         spec = registry.resolve("deh264")
         batch = args.batch or _auto_batch(spec, info.width, info.height)
-        stages.append(SuperRes(spec, use_amp=use_amp, batch_size=batch,
-                               compile_model=args.compile, use_trt=not args.no_trt))
-    if args.denoise:
+        sr = SuperRes(spec, use_amp=use_amp, batch_size=batch,
+                      compile_model=args.compile, use_trt=not args.no_trt)
+        stages.append(StrengthBlend(sr, args.deh264))
+    if args.denoise and args.denoise > 0.005:  # 同上
         spec = registry.resolve("scunet")
         batch = args.batch or _auto_batch(spec, info.width, info.height)
-        stages.append(SuperRes(spec, use_amp=use_amp, batch_size=batch,
-                               compile_model=args.compile, use_trt=not args.no_trt))
+        sr = SuperRes(spec, use_amp=use_amp, batch_size=batch,
+                      compile_model=args.compile, use_trt=not args.no_trt)
+        stages.append(StrengthBlend(sr, args.denoise))
     if args.model != "off":
         spec = resolve_for(args.model)
         batch = args.batch or _auto_batch(spec, info.width, info.height)
@@ -109,8 +112,10 @@ def main(argv=None) -> int:
                     help="auto | nomos8k | x4plus | anime | off（默认 auto 按内容选）")
     ap.add_argument("--content", choices=["real", "anime"], default="real",
                     help="auto 模型选择时的内容类型")
-    ap.add_argument("--deh264", action="store_true", help="超分前先做 H.264 压缩伪影修复")
-    ap.add_argument("--denoise", action="store_true", help="超分前先去噪")
+    ap.add_argument("--deh264", nargs="?", const=1.0, default=None, type=float,
+                    metavar="强度", help="超分前做 H.264 压缩伪影修复（可选强度 0-1，默认 1.0；<1 与原帧混合）")
+    ap.add_argument("--denoise", nargs="?", const=1.0, default=None, type=float,
+                    metavar="强度", help="超分前去噪（可选强度 0-1，默认 1.0；<1 与原帧混合）")
     ap.add_argument("--interp", type=int, default=0, choices=[0, 2],
                     help="插帧倍率（2 = 帧率翻倍）")
     ap.add_argument("--crf", type=int, default=28, help="感知质量（av1 默认 28）")

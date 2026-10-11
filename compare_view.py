@@ -117,10 +117,9 @@ class _VideoPage(QWidget):
         # 鼠标事件全部交给页面（悬停擦除/滚轮缩放/拖拽平移），视频件不消费
         for w in (self.w1, self.w2):
             w.setAttribute(Qt.WA_TransparentForMouseEvents, True)
-        # 分割线不再由本页管理：QVideoWidget 的视频呈现面会盖住窗内一切子控件/
-        # 兄弟窗口（tool 窗定位簿记也不可信），改由 CompareDialog 创建为顶层
-        # 对话框的直接原生子控件（与视频件同一 HWND 树，SetWindowPos z 序可靠），
-        # 位置经 mapToGlobal/mapFromGlobal 锚定 w2 遮罩边缘（DPR 感知）。
+        # 分割线不再由本页管理：QVideoWidget 的视频呈现面会盖住同窗树内的一切
+        # 兄弟/子窗口（z 序抢不过），独立 Tool 窗的坐标簿记也不可信——最终方案是
+        # 无父窗口的置顶 Tool 窗，由 CompareDialog 按遮罩边缘的全局逻辑坐标维护
         self.line = None
 
     # —— 布局 ——
@@ -139,9 +138,9 @@ class _VideoPage(QWidget):
 
     def set_mode(self, mode: str):
         self.mode = mode
-        self.w2.clearMask()
+        self._last_layout_key = None      # 失效 memo：强制 relayout 真正执行，重建 mask/几何
         self._clamp_pan()
-        self.relayout()
+        self.relayout()                   # wipe 分支 setMask；side 分支自会 clearMask
 
     def set_split(self, ratio: float):
         self.split = max(0.0, min(ratio, 1.0))
@@ -607,6 +606,14 @@ class CompareDialog(QDialog):
         if not show:
             lw.hide()
             return
+        if self.mode == self.MODE_WIPE:
+            m = vp.w2.mask().boundingRect()
+            # 守卫条件用 round(W×split)>0：退化区间（页面左缘 <0.5 逻辑 px，重建
+            # 仍产生空 mask）不重建——否则与 relayout 的 layoutChanged 无限互递归
+            # → 原生栈溢出硬崩（Reviewer 复现）；该区间保持空 mask 合法、线贴边
+            if vp.width() > 0 and m.width() <= 0 and round(vp.width() * vp.split) > 0:
+                vp._last_layout_key = None
+                vp.relayout()             # 遮罩意外丢失时先重建再定位（加固）
         edge_global = vp.w2.mapToGlobal(
             QPoint(vp.w2.mask().boundingRect().right(), 0))
         lw.setGeometry(edge_global.x() - 2, vp.mapToGlobal(QPoint(0, 0)).y(),

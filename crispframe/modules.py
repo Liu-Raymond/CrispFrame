@@ -12,6 +12,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any
 
+import cv2
+
 from . import registry
 from .pipeline import Interpolator
 
@@ -65,6 +67,29 @@ class BuiltModule:
     interpolator: Interpolator | None = None
 
 
+class StrengthBlend:
+    """AI 修复输出与原帧按强度 alpha 混合（1.0 = 纯 AI 输出）。
+
+    修复类模型没有强度旋钮，alpha 混合是通用的"强度"等效实现：
+    0.6 = 60% 模型输出 + 40% 原帧。strength <= 0 时直接透传原帧
+    （等价于模块关闭），>= 0.995 时跳过混合（纯 AI 输出）。"""
+
+    def __init__(self, inner, strength: float):
+        self.inner = inner
+        self.strength = max(0.0, min(1.0, float(strength)))
+
+    def __call__(self, frames):
+        a = self.strength
+        if a <= 0.005:
+            return frames                     # 强度 0：原帧直通
+        out = self.inner(frames)
+        if a >= 0.995:
+            return out
+        # 帧数一致性是 1x 修复模型的契约（若未来包装会变帧数的 stage，这里会拦截）
+        assert len(out) == len(frames), "StrengthBlend: inner 输出帧数与输入不一致"
+        return [cv2.addWeighted(o, a, i, 1.0 - a, 0) for o, i in zip(out, frames)]
+
+
 # ---------------------------------------------------------------- ModuleSpec
 
 
@@ -115,30 +140,59 @@ class _Deh264Spec(ModuleSpec):
         super().__init__(
             key="deh264", name="去压缩",
             description="修复 H.264 压缩伪影（块状/蚊噪），建议放在超分之前",
-            order=0)
+            order=0,
+            params=[
+                ParamSpec("strength", "强度", "float", 1.0,
+                          min=0.0, max=1.0, step=0.05,
+                          tip="1.0 = 完全 AI 修复；调低 = 与原帧混合，去痕迹更保守"),
+            ])
 
     def build(self, params: dict, ctx: BuildContext) -> BuiltModule:
-        from .sr import SuperRes
+        strength = float(params["strength"])
+        if strength <= 0.005:
+            return BuiltModule(stages=[])     # 强度 0：等价关闭，模型都不加载
         spec = registry.resolve("deh264")
-        return BuiltModule(stages=[_make_sr(spec, ctx)])
+        return BuiltModule(stages=[StrengthBlend(_make_sr(spec, ctx), strength)])
 
     def summary(self, params: dict, src_h: int = 0) -> str:
-        return "deH264 压缩伪影修复 1x"
+        a = float(params.get("strength", 1.0))
+        return f"deH264 压缩伪影修复 · 强度{a:.0%}"
 
 
 class _DenoiseSpec(ModuleSpec):
     def __init__(self):
+        # 降噪模型下拉按磁盘文件自动出现：GAN 变体（更锐、细节多但可能放大噪声）
+        # 权重无公开直链，放入 models/pretrained/scunet_color_real_gan.pth 即可选
+        choices = [("SCUNet PSNR（保守·干净）", "scunet")]
+        if (registry.PRETRAINED_DIR / "scunet_color_real_gan.pth").exists():
+            choices.append(("SCUNet GAN（锐·细节多）", "scunet-gan"))
+        if (registry.PRETRAINED_DIR / "NAFNet-SIDD-width64.pth").exists():
+            choices.append(("NAFNet SIDD（参考级·慢）", "nafnet-sidd"))
         super().__init__(
             key="denoise", name="降噪",
             description="去除传感器/胶片噪点（SCUNet），建议放在超分之前",
-            order=1)
+            order=1,
+            params=[
+                ParamSpec("model", "模型", "choice", "scunet", choices,
+                          tip="PSNR 保守干净；GAN 更锐但可能把噪声当细节放大"),
+                ParamSpec("strength", "强度", "float", 1.0,
+                          min=0.0, max=1.0, step=0.05,
+                          tip="1.0 = 完全 AI 降噪；调低 = 与原帧混合，保细节更保守"),
+            ])
 
     def build(self, params: dict, ctx: BuildContext) -> BuiltModule:
-        spec = registry.resolve("scunet")
-        return BuiltModule(stages=[_make_sr(spec, ctx)])
+        strength = float(params["strength"])
+        if strength <= 0.005:
+            return BuiltModule(stages=[])
+        spec = registry.resolve(params["model"])
+        return BuiltModule(stages=[StrengthBlend(_make_sr(spec, ctx), strength)])
 
     def summary(self, params: dict, src_h: int = 0) -> str:
-        return "SCUNet 去噪 1x"
+        a = float(params.get("strength", 1.0))
+        names = {"scunet-gan": "SCUNet GAN", "nafnet-sidd": "NAFNet SIDD"}
+        model = names.get(params.get("model"), "SCUNet")
+        tail = f" · 强度{a:.0%}" if a < 0.995 else ""
+        return f"{model} 去噪{tail}"
 
 
 # 超分模型选项：第一项 auto = 按 内容类型 + 目标高度/源高度 自动选（元组 = (显示, 值)）
