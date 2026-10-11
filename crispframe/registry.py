@@ -34,7 +34,11 @@ BUILTIN: dict[str, ModelSpec] = {
     "deh264": ModelSpec("deh264", PRETRAINED_DIR / "deH264_SuperUltraCompact.safetensors", 1, "dedeblur", "real"),
     # 去噪 1x（超分前置）
     "scunet": ModelSpec("scunet", PRETRAINED_DIR / "scunet_color_real_psnr.pth", 1, "denoise", "real"),
-    # NAFNet SIDD width64：官方真实照片降噪参考模型（SIDD 基准）。spandrel 主库原生支持。
+    # SCUNet GAN 变体（更锐）：A/B 目测与 PSNR 无可见差异且 4K 慢 2.5 倍，已从 UI 移除；
+    # 权重可从 huggingface.co/krnl/ScuNET 取回放入 models/pretrained 即恢复可选
+    "scunet-gan": ModelSpec("scunet-gan", PRETRAINED_DIR / "scunet_color_real_gan.pth", 1, "denoise", "real"),
+    # NAFNet SIDD width32（官方 SIDD 降噪模型轻量版，width64 4K 软解不可用已弃）：
+    # 权重镜像 huggingface.co/nyanko7/nafnet-models。spandrel 主库原生支持
     "nafnet-sidd": ModelSpec("nafnet-sidd", PRETRAINED_DIR / "NAFNet-SIDD-width32.pth", 1, "denoise", "real"),
 }
 
