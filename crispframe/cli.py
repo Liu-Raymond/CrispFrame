@@ -127,10 +127,6 @@ def main(argv=None) -> int:
     ap.add_argument("--face", action="store_true", help="超分后对人脸区域做 CodeFormer 修复")
     ap.add_argument("--face-w", type=float, default=0.8,
                     help="面部保真度 0-1：低=更'AI 修复'（细节多但可能改变五官内容），高=更保真（默认 0.8）")
-    ap.add_argument("--extreme", action="store_true",
-                    help="极致画质档：改用 SeedVR2 生成式修复（~0.2 帧/s，质量超快速档，长片慎用）")
-    ap.add_argument("--extreme-res", type=int, default=2160,
-                    help="极致档输出高度（默认 2160=4K）")
     ap.add_argument("--target-res", default=None,
                     help="输出分辨率 WxH（如 3840x2160）。SR 后先缩放到该分辨率再锐化——"
                          "超必要分辨率交给播放器缩放会整体发软，建议对齐显示设备原生分辨率")
@@ -165,17 +161,6 @@ def main(argv=None) -> int:
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
     info = probe(args.input)
-
-    if args.extreme:
-        from .extreme import run_seedvr2
-        print(f"极致档（SeedVR2 生成式）：输出高度 {args.extreme_res}px，速度 ~0.2 帧/s，请耐心等待")
-        result = run_seedvr2(args.input, out_path.parent, resolution=args.extreme_res,
-                             max_frames=int(args.max_seconds * info.fps) if args.max_seconds else None)
-        if args.output and result.resolve() != out_path.resolve():
-            result.replace(out_path)
-        size_mb = out_path.stat().st_size / 1e6
-        print(f"\n完成: {out_path.name} {size_mb:.1f} MB")
-        return 0
 
     print(f"输入: {info.width}x{info.height} @ {info.fps:.3f}fps, {info.frames or '?'} 帧, {info.duration:.1f}s")
     stages = build_stages(args, info)
