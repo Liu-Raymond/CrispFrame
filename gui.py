@@ -1067,16 +1067,50 @@ class MainWindow(QMainWindow):
 
 
 def _excepthook(t, v, tb):
-    """双击启动（pythonw 无控制台）时把崩溃留档，否则错误无声消失。"""
+    """双击启动（无控制台）时把崩溃留档，否则错误无声消失。"""
     import traceback
-    (Path(__file__).parent / "crash.log").write_text(
+    from crispframe.layout import ROOT
+    (ROOT / "crash.log").write_text(
         "".join(traceback.format_exception(t, v, tb)), encoding="utf-8")
     sys.__stderr__ and sys.__stderr__.write(str(v))
 
 
+def _dispatch_worker_modes() -> int | None:
+    """隐藏模式：--cli <args...> 命令行透传到 crispframe.cli（自动化测试用）。
+    返回退出码表示已处理；None = 继续 GUI。"""
+    argv = sys.argv[1:]
+    if "--cli" in argv:
+        i = argv.index("--cli")
+        from crispframe.cli import main as cli_main
+        return cli_main(argv[i + 1:])
+    return None
+
+
 def main():
     sys.excepthook = _excepthook
+    code = _dispatch_worker_modes()
+    if code is not None:
+        raise SystemExit(code)
     app = QApplication(sys.argv)
+    # 窗口/任务栏图标（exe 图标由 launcher 资源提供；此处管 Qt 窗口这层）
+    app_icon = Path(__file__).resolve().parent / "crispframe" / "appicon.ico"
+    if app_icon.exists():
+        from PySide6.QtGui import QIcon
+        app.setWindowIcon(QIcon(str(app_icon)))
+    # 分发目标可能没有 NVIDIA 卡：启动即做 CUDA 体检，别让用户在任务中途撞裸堆栈
+    try:
+        import torch
+        cuda_ok = torch.cuda.is_available()
+    except Exception:
+        cuda_ok = False
+    if not cuda_ok:
+        from PySide6.QtWidgets import QMessageBox
+        QMessageBox.critical(
+            None, "CrispFrame",
+            "未检测到可用的 NVIDIA CUDA 环境。\n\n"
+            "AI 增强（超分/插帧/降噪）需要 NVIDIA 显卡（RTX 推荐）与最新显卡驱动。\n\n"
+            "程序即将退出。")
+        return
     app.setStyleSheet(DARK_QSS)
     win = MainWindow()
     win.show()

@@ -2,7 +2,9 @@
 from dataclasses import dataclass
 from pathlib import Path
 
-PRETRAINED_DIR = Path(__file__).resolve().parent.parent / "models" / "pretrained"
+from .layout import ROOT
+
+PRETRAINED_DIR = ROOT / "models" / "pretrained"
 
 
 @dataclass

@@ -8,6 +8,8 @@ import sys
 from dataclasses import dataclass
 from pathlib import Path
 
+from .layout import ROOT
+
 _WINGET_GLOB = os.path.join(
     os.environ.get("LOCALAPPDATA", ""),
     "Microsoft", "WinGet", "Packages", "Gyan.FFmpeg*",
@@ -20,7 +22,15 @@ def _find_exe(name: str) -> str:
     p = _EXE_CACHE.get(name)
     if p:
         return p
-    p = shutil.which(name)
+    # 随包分发的 ffmpeg 优先：包根 ffmpeg/、包根、runtime 同级目录
+    py_dir = Path(sys.executable).resolve().parent
+    for base in (ROOT / "ffmpeg", ROOT, py_dir, py_dir / "ffmpeg"):
+        cand = base / (name + ".exe")
+        if cand.exists():
+            p = str(cand)
+            break
+    if not p:
+        p = shutil.which(name)
     if not p:
         hits = glob.glob(os.path.join(_WINGET_GLOB, "**", "bin", name + ".exe"),
                          recursive=True)

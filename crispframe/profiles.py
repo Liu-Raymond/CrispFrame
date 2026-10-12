@@ -10,9 +10,10 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from .codec import CodecSettings
+from .layout import ROOT
 from .modules import ModuleInstance
 
-PROFILE_DIR = Path(__file__).resolve().parent.parent / "config" / "profiles"
+PROFILE_DIR = ROOT / "config" / "profiles"
 
 
 @dataclass
