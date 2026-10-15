@@ -1,5 +1,6 @@
 # torch 需 CUDA 12.8 索引（RTX 50 系 Blackwell 必需）：
 #   pip install torch torchvision --index-url https://download.pytorch.org/whl/cu128
+# torchvision 虽无直接引用，但 spandrel（LaMa 架构）import 时必需
 torch
 torchvision
 spandrel>=0.4

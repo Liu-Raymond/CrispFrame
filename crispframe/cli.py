@@ -36,7 +36,8 @@ def build_stages(args, info) -> list:
 
     def resolve_for(name):
         if name == "auto":
-            name = "anime" if args.content == "anime" else "nomos8k"
+            # 定版基线：真人 NomosUni 2x / 动漫 AnimeJaNai（与 GUI auto 一致）
+            name = "anime" if args.content == "anime" else "nomosuni"
         return registry.resolve(name)
 
     if args.deh264 and args.deh264 > 0.005:   # 与 GUI build 的 ≤0.005 短路语义一致
@@ -83,7 +84,7 @@ def build_interpolator(args, info, device: str = "cuda"):
         total_scale = 1
         if args.model != "off":
             spec = registry.resolve("anime" if args.content == "anime" and args.model == "auto"
-                                    else (args.model if args.model != "auto" else "nomos8k"))
+                                    else (args.model if args.model != "auto" else "nomosuni"))
             total_scale *= spec.scale
         out_h = info.height * total_scale
         scale = 0.5 if out_h >= 1400 else 1.0
@@ -97,7 +98,7 @@ def out_name(src: Path, args) -> str:
     if args.denoise:
         tags.append("dn")
     if args.model != "off":
-        m = args.model if args.model != "auto" else ("anime" if args.content == "anime" else "nomos8k")
+        m = args.model if args.model != "auto" else ("anime" if args.content == "anime" else "nomosuni")
         tags.append(m)
     if args.interp:
         tags.append(f"x{args.interp}interp" if args.interp != 2 else "interp")
