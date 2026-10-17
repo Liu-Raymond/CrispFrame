@@ -1,11 +1,11 @@
 """AI 模块注册表：GUI v2 模块链的单一事实来源。
 
-模块 = 用户可添加/排序/开关的增强环节。四个内置模块：
-去压缩 → 降噪 → 超分 → 插帧（默认顺序；插帧实际在管线链尾执行）。
+模块 = 用户可添加/排序/开关的增强环节。五个内置模块：
+去压缩 → 降噪 → 超分 → 插帧/平滑（默认顺序；时序模块实际在管线链尾执行）。
 
 - ModuleSpec：模块类型定义（参数 schema + 构建）
 - ModuleInstance：链上的一个模块实例（参数值 + 开关），可 JSON 序列化
-- build_chain()：把实例链组装成 pipeline.run 需要的 (stages, interpolator)
+- build_chain()：把实例链组装成 pipeline.run 需要的 (stages, interpolator, vf_pre)
 """
 from __future__ import annotations
 
@@ -65,6 +65,16 @@ class BuildContext:
 class BuiltModule:
     stages: list = field(default_factory=list)          # list[BatchStage]
     interpolator: Interpolator | None = None
+    vf_pre: str = ""      # 编码侧前置滤镜（tmix 混合+fps 回采），build_chain 收集给 codec
+
+
+# 平滑三档：时域混合窗从轻到重（中档 = 2026-10 用户验收定版，等效 180° 快门）
+_SMOOTH_MIX = {
+    "light":  "tmix=frames=2:weights='1 3'",   # 当前帧主导，轻微平滑
+    "medium": "tmix=frames=2",                  # 相邻均混，等效 180° 快门
+    "heavy":  "tmix=frames=3",                  # 更宽时域窗，最强平滑（运动模糊加重）
+}
+_SMOOTH_LABEL = {"light": "轻度", "medium": "中度", "heavy": "重度"}
 
 
 class StrengthBlend:
@@ -98,9 +108,9 @@ class ModuleSpec:
     key: str
     name: str                     # 显示名
     description: str
-    order: int                    # 默认链序（去压缩 0 → 降噪 1 → 超分 2 → 插帧 3）
+    order: int                    # 默认链序（去压缩 0 → 降噪 1 → 超分 2 → 插帧 3 → 平滑 4）
     params: list[ParamSpec] = field(default_factory=list)
-    singleton: bool = False       # 链中最多一个（插帧）
+    singleton: bool = False       # 链中最多一个（插帧/平滑这类时序模块）
     always_last: bool = False     # 时序操作，视觉上可拖动但实际恒在链尾
 
     def build(self, params: dict, ctx: BuildContext) -> BuiltModule:
@@ -133,7 +143,7 @@ def _make_sr(spec: registry.ModelSpec, ctx: BuildContext,
                     tone_match=tone_match)
 
 
-# ---------------------------------------------------------------- 四个模块
+# ---------------------------------------------------------------- 五个模块
 
 class _Deh264Spec(ModuleSpec):
     def __init__(self):
@@ -311,8 +321,37 @@ class _InterpSpec(ModuleSpec):
         return s
 
 
+class _SmoothSpec(ModuleSpec):
+    def __init__(self):
+        super().__init__(
+            key="smooth", name="平滑",
+            description="RIFE 2x 插帧 + 时域运动补偿混合后回采源帧率"
+                        "（等效快门平滑，抹平内容本身的时域顿挫；输出帧率不变）",
+            order=4, singleton=True, always_last=True,
+            params=[
+                ParamSpec("level", "平滑程度", "choice", "medium",
+                          [("轻度（当前帧主导）", "light"),
+                           ("中度（180° 快门·推荐）", "medium"),
+                           ("重度（最强平滑）", "heavy")],
+                          tip="中度 = 验收定版配方；重度运动模糊明显，先试中度"),
+            ])
+
+    def build(self, params: dict, ctx: BuildContext) -> BuiltModule:
+        from .interp import RIFEInterpolator
+        # auto 尺度与插帧模块一致；TRT 撕裂 bug 未解，平滑恒走 torch bf16
+        scale = 0.5 if ctx.height * ctx.upstream_scale >= 1400 else 1.0
+        mix = _SMOOTH_MIX[params["level"]]
+        return BuiltModule(
+            interpolator=RIFEInterpolator(device="cuda", scale=scale, use_trt=False),
+            vf_pre=f"{mix},fps={ctx.fps:.6f}")
+
+    def summary(self, params: dict, src_h: int = 0) -> str:
+        return f"RIFE 2x + 混合回采 · {_SMOOTH_LABEL[params['level']]}"
+
+
 SPECS: dict[str, ModuleSpec] = {s.key: s for s in
-                                (_Deh264Spec(), _DenoiseSpec(), _SuperResSpec(), _InterpSpec())}
+                                (_Deh264Spec(), _DenoiseSpec(), _SuperResSpec(),
+                                 _InterpSpec(), _SmoothSpec())}
 
 
 def get(key: str) -> ModuleSpec:
@@ -353,6 +392,16 @@ class ModuleInstance:
         return ModuleInstance(d["key"], dict(d.get("params") or {}), bool(d.get("enabled", True)))
 
 
+def resolve_temporal_conflict(instances: list[ModuleInstance]) -> None:
+    """链级互斥收敛（就地修改）：插帧/平滑同时启用时保留插帧（链序靠前的原功能）。
+    用于加载外部配置（profile JSON 可能含旧版/手编辑的非法组合）。"""
+    seen = False
+    for inst in sorted(instances, key=lambda m: m.spec.order):
+        if inst.key in ("interp", "smooth") and inst.enabled:
+            inst.enabled = not seen
+            seen = True
+
+
 def default_chain(content: str = "real") -> list[ModuleInstance]:
     """新任务默认链：定版快速档（模型 auto 按内容+目标分辨率解析，插帧默认关）。"""
     sr = ModuleInstance("sr", {"content": content})
@@ -362,8 +411,9 @@ def default_chain(content: str = "real") -> list[ModuleInstance]:
 
 
 def build_chain(instances: list[ModuleInstance],
-                ctx: BuildContext) -> tuple[list, Interpolator | None]:
-    """实例链 → (stages, interpolator)。禁用模块跳过；插帧提取为 interpolator。"""
+                ctx: BuildContext) -> tuple[list, Interpolator | None, str]:
+    """实例链 → (stages, interpolator, vf_pre)。禁用模块跳过；时序模块提取为
+    interpolator，其编码侧前置滤镜（混合+回采）经 vf_pre 交给 codec。"""
     ordered = sorted(instances, key=lambda m: m.spec.order)
     # 插帧 auto 尺度需要知道上游超分的实际放大倍数（目标高度/源高度）
     for inst in ordered:
@@ -374,6 +424,7 @@ def build_chain(instances: list[ModuleInstance],
             break
     stages: list = []
     interpolator = None
+    vf_pre = ""
     for inst in ordered:
         if not inst.enabled:
             continue
@@ -381,6 +432,8 @@ def build_chain(instances: list[ModuleInstance],
         stages.extend(built.stages)
         if built.interpolator is not None:
             if interpolator is not None:
-                raise ValueError("插帧模块只能添加一个")
+                raise ValueError("插帧与平滑模块只能二选一（都是时序链尾操作）")
             interpolator = built.interpolator
-    return stages, interpolator
+        if built.vf_pre:
+            vf_pre = built.vf_pre
+    return stages, interpolator, vf_pre

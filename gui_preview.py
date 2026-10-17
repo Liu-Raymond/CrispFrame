@@ -87,6 +87,11 @@ class RenderModule(QThread):
         try:
             info = self.info or probe(self.src)
             ctx = BuildContext(width=info.width, height=info.height, fps=info.fps)
+            if self.inst.spec.key == "smooth":
+                # 平滑是时域效果：单帧看不到混合；且其 build 会急切加载 RIFE
+                # 权重上 GPU，为一条提示不值得——build 之前就早退
+                self.got.emit(None, f"{self.label}（时域效果，请用『渲染片段』预览）")
+                return
             built = self.inst.spec.build(self.inst.params, ctx)
             if built.interpolator is not None:
                 f1 = grab_frame(self.src, self.t)
@@ -134,6 +139,9 @@ class RenderSegment(QThread):
             encode = EncodeConfig(
                 args=["-c:v", "libx264", "-preset", "veryfast",
                       "-crf", "18", "-pix_fmt", "yuv420p"],
+                # 平滑等时域模块的混合/回采滤镜进预览，片段才反映真实效果
+                vf=(f"{built.vf_pre},scale=out_color_matrix=bt709:out_range=tv"
+                    if built.vf_pre else None),
                 audio_args=["-an"],           # 预览段不带音轨：兼容性 + 省时间
             )
             stats = pipeline_run(
