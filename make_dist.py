@@ -20,9 +20,9 @@ ROOT = Path(__file__).resolve().parent
 STAGE = ROOT / "build" / "CrispFrame"
 RUNTIME = STAGE / "runtime"
 SITE = RUNTIME / "Lib" / "site-packages"
-VERSION = "1.0.0"
+VERSION = "1.1.0"
 
-APP_FILES = ["gui.py", "gui_preview.py", "compare_view.py"]
+APP_FILES = ["gui.py", "gui_preview.py", "archive_page.py", "compare_view.py"]
 
 # 随包分发的权重（与 registry/质量对比定版一致；缺失项由 registry 存在性门控自动隐藏）
 _DISTRIBUTED_WEIGHTS = [
@@ -112,6 +112,13 @@ def main() -> int:
     for w in _DISTRIBUTED_WEIGHTS:
         shutil.copy2(ROOT / "models" / "pretrained" / w, STAGE / "models" / "pretrained" / w)
     ffmpeg_stage = ROOT / "build" / "ffmpeg_bundle"
+    if not all((ffmpeg_stage / n).exists() for n in ("ffmpeg.exe", "ffprobe.exe")):
+        # 大清理后重建：从本机 ffmpeg 实际位置（ffutils 同款定位链）组装 bundle
+        from crispframe.ffutils import ffmpeg as _ff, ffprobe as _fp
+        ffmpeg_stage.mkdir(parents=True, exist_ok=True)
+        for src_exe, name in ((_ff(), "ffmpeg.exe"), (_fp(), "ffprobe.exe")):
+            shutil.copy2(src_exe, ffmpeg_stage / name)
+        print(f"[dist] ffmpeg_bundle 已从 {_ff()} 重建", flush=True)
     (STAGE / "ffmpeg").mkdir(parents=True, exist_ok=True)
     for name in ("ffmpeg.exe", "ffprobe.exe"):
         shutil.copy2(ffmpeg_stage / name, STAGE / "ffmpeg" / name)

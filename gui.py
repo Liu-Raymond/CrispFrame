@@ -95,8 +95,12 @@ class Task:
     def enabled_modules(self) -> list[ModuleInstance]:
         return [m for m in self.modules if m.enabled]
 
+    def module_tag(self, m: ModuleInstance) -> str:
+        """日志/产物名用的模块标签，平滑带档位以便三档产物互不覆盖。"""
+        return f"smooth-{m.params['level']}" if m.key == "smooth" else m.key
+
     def out_path(self) -> Path:
-        tags = "+".join(m.key for m in self.enabled_modules()) or "pass"
+        tags = "+".join(self.module_tag(m) for m in self.enabled_modules()) or "pass"
         return self.out_dir / f"{self.src.stem}.cf.{tags}{self.codec_settings.ext()}"
 
     def out_size(self) -> tuple[int, int]:
@@ -116,6 +120,8 @@ class Task:
         return self.info.width, self.info.height
 
     def out_fps_value(self) -> float:
+        if any(m.key == "smooth" for m in self.enabled_modules()):
+            return self.info.fps    # 平滑恒回采源帧率，自定义帧率不适用（会失步）
         has_interp = any(m.key == "interp" for m in self.enabled_modules())
         return codec.out_fps(self.codec_settings, self.info.fps, has_interp)
 
@@ -161,9 +167,13 @@ class Worker(QThread):
         ok_all = True
         for task in self.tasks:
             if self._cancel:
-                break
+                # 开跑前就已取消：也要置终态（否则任务永远卡在"排队中"，无法重跑）
+                self.taskDone.emit(task, False, "已取消")
+                ok_all = False
+                continue
             try:
-                self._run_one(task)
+                if not self._run_one(task):
+                    ok_all = False
             except Exception as e:  # noqa: BLE001
                 self.log.emit(f"[错误] {task.src.name}: {e}")
                 self.taskDone.emit(task, False, str(e))
@@ -171,26 +181,32 @@ class Worker(QThread):
         self.allDone.emit(ok_all and not self._cancel,
                           "已取消" if self._cancel else ("全部完成" if ok_all else "有任务失败"))
 
-    def _run_one(self, task: Task):
+    def _run_one(self, task: Task) -> bool:
+        """执行单个增强任务，返回是否成功（失败/取消均 False）。"""
         self.log.emit(f"▶ {task.src.name}")
-        ctx = BuildContext(width=task.info.width, height=task.info.height,
-                           fps=task.info.fps)
-        stages, interp = modules.build_chain(task.modules, ctx)
-        cs = task.codec_settings
-        encode = EncodeConfig(**codec.build_encode_config_kwargs(
-            cs, task.info.fps, interp is not None))
         out = task.out_path()
         out.parent.mkdir(parents=True, exist_ok=True)
+        ctx = BuildContext(width=task.info.width, height=task.info.height,
+                           fps=task.info.fps)
+        stages, interp, vf_pre = modules.build_chain(task.modules, ctx)
+        cs = task.codec_settings
+        encode = EncodeConfig(**codec.build_encode_config_kwargs(
+            cs, task.info.fps, interp is not None, vf_pre=vf_pre))
         t0 = time.perf_counter()
         run(task.info, out, stages=stages, interpolator=interp, encode=encode,
             batch_size=1, max_seconds=None,
             progress_callback=lambda d, t: self.taskProgress.emit(task.src.name, d, t),
             cancel_check=lambda: self._cancel)
+        if self._cancel:
+            # 中途取消：产物可能不完整，置取消终态（保持覆盖式写盘的既有行为）
+            self.taskDone.emit(task, False, "已取消")
+            return False
         dt = time.perf_counter() - t0
         size_mb = out.stat().st_size / 1e6
-        chain = "+".join(m.key for m in task.enabled_modules()) or "pass"
+        chain = "+".join(task.module_tag(m) for m in task.enabled_modules()) or "pass"
         self.log.emit(f"✓ {out.name}  [{chain}] {dt:.0f}s / {size_mb:.1f}MB")
         self.taskDone.emit(task, True, out.name)
+        return True
 
 
 # ---------------------------------------------------------------- 模块链 UI
@@ -352,6 +368,9 @@ class ModuleChainList(QWidget):
 
     def _toggle(self, inst: ModuleInstance, on: bool):
         inst.enabled = on
+        if on:
+            self._yield_temporal_slot(inst.key)   # 对方模块自动让位（保留在链上）
+        self.rebuild()
         self.chainChanged.emit()
 
     def _refresh_menu(self):
@@ -374,8 +393,18 @@ class ModuleChainList(QWidget):
         for m in self.task.modules:
             if m.key == key:
                 m.enabled = True
+        self._yield_temporal_slot(key)
         self.rebuild()
         self.chainChanged.emit()
+
+    def _yield_temporal_slot(self, key: str):
+        """插帧与平滑同为时序链尾、互斥：启用其一时自动停用另一个（保留在链上）。"""
+        if key not in ("interp", "smooth"):
+            return
+        other = "interp" if key == "smooth" else "smooth"
+        for m in self.task.modules:
+            if m.key == other:
+                m.enabled = False
 
     def _add(self, key: str):
         if not self.task:
@@ -385,6 +414,7 @@ class ModuleChainList(QWidget):
         # 保持默认链序插入
         self.task.modules.append(inst)
         self.task.modules.sort(key=lambda m: m.spec.order)
+        self._yield_temporal_slot(key)
         self.rebuild()
         self.chainChanged.emit()
 
@@ -416,13 +446,11 @@ class OutputSettingsDialog(QDialog):
         tabs.addTab(self._audio_tab(), "音频")
         tabs.addTab(self._sub_tab(), "字幕")
 
-        # 容器（Remux 行）
+        # 容器（全量清单 ∩ 本机 ffmpeg 支持 ∩ 当前编码器兼容集，动态检测）
         row = QHBoxLayout()
         row.addWidget(QLabel("封装容器"))
         self.container = QComboBox()
-        self.container.addItem("MKV（推荐，字幕/多音轨原样）", "mkv")
-        self.container.addItem("MP4（兼容性优先）", "mp4")
-        self.container.setCurrentIndex(0 if self.cs.container == "mkv" else 1)
+        self._rebuild_container_box()
         self.container.currentIndexChanged.connect(
             lambda _: self._set("container", self.container.currentData()))
         row.addWidget(self.container)
@@ -606,8 +634,22 @@ class OutputSettingsDialog(QDialog):
     # —— 状态同步 ——
     def _set(self, key: str, value):
         setattr(self.cs, key, value)
-        if key in ("encoder", "crf", "quality_mode") or key == "bit_depth":
+        if key in ("encoder", "crf", "quality_mode", "bit_depth"):
             self._refresh_hint()
+
+    def _rebuild_container_box(self):
+        """按当前编码器重建容器下拉（muxer 支持 ∩ 编码器兼容集）。"""
+        wanted = self.cs.container
+        self.container.blockSignals(True)
+        self.container.clear()
+        containers = codec.available_containers(self.cs.encoder)
+        for key, spec in containers.items():
+            self.container.addItem(f"{spec['label']} — {spec['note']}", key)
+        if self.container.findData(wanted) < 0:
+            wanted = "matroska"     # 当前容器与编码器不兼容 → 回退推荐容器
+        self.container.setCurrentIndex(max(0, self.container.findData(wanted)))
+        self.cs.container = wanted
+        self.container.blockSignals(False)
 
     def _on_encoder_change(self):
         key = self.encoder.currentData()
@@ -631,6 +673,7 @@ class OutputSettingsDialog(QDialog):
             self.depth.addItem(f"{d}bit", d)
         self.depth.setCurrentIndex(list(spec.depths).index(self.cs.bit_depth))
         self.depth.blockSignals(False)
+        self._rebuild_container_box()   # 编码器族变化 → 兼容容器集变化
         self._sync_labels()
         self._refresh_hint()
 
@@ -685,6 +728,7 @@ class OutputSettingsDialog(QDialog):
         if prof.modules:
             self.task.modules = [ModuleInstance(m.key, dict(m.params), m.enabled)
                                  for m in prof.modules]
+            modules.resolve_temporal_conflict(self.task.modules)
             for m in self.task.modules:
                 m.src_h = self.task.info.height
         self.encoder.blockSignals(True)
@@ -704,6 +748,7 @@ class OutputSettingsDialog(QDialog):
 
 class HomePage(QWidget):
     filesChanged = Signal()
+    archiveRequested = Signal()
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -736,12 +781,20 @@ class HomePage(QWidget):
         bar.addWidget(add)
         bar.addWidget(clear)
         bar.addStretch()
+        arch = QPushButton("存档压缩 →")
+        arch.setToolTip("纯压缩不增强：SVT-AV1 恒定画质直通转码，保留全部音轨/字幕/章节，"
+                        "编码后自动验证完整性")
+        arch.clicked.connect(self.archiveRequested.emit)
+        bar.addWidget(arch)
         go = QPushButton("下一步：配置任务 →")
         go.setObjectName("startBtn")
         go.clicked.connect(self.filesChanged.emit)
         bar.addWidget(go)
         v.addLayout(bar)
         self.go_btn = go
+        self.archive_btn = arch
+        self.go_btn.setEnabled(False)       # 无文件时两个入口都禁用
+        self.archive_btn.setEnabled(False)
         self.setAcceptDrops(True)
 
     def _pick(self):
@@ -755,12 +808,15 @@ class HomePage(QWidget):
             if p.suffix.lower() in VIDEO_EXTS and p.exists():
                 self.file_list.addItem(str(p))
         self.file_list.setVisible(self.file_list.count() > 0)
-        self.go_btn.setEnabled(self.file_list.count() > 0)
+        has = self.file_list.count() > 0
+        self.go_btn.setEnabled(has)
+        self.archive_btn.setEnabled(has)
 
     def _clear(self):
         self.file_list.clear()
         self.file_list.setVisible(False)
         self.go_btn.setEnabled(False)
+        self.archive_btn.setEnabled(False)
 
     def paths(self) -> list[Path]:
         return [Path(self.file_list.item(i).text())
@@ -1000,10 +1056,16 @@ class MainWindow(QMainWindow):
         self.setCentralWidget(self.stack)
         self.home = HomePage()
         self.task_page = TaskPage()
+        from archive_page import ArchivePage
+        self.archive_page = ArchivePage()
         self.stack.addWidget(self.home)
         self.stack.addWidget(self.task_page)
+        self.stack.addWidget(self.archive_page)
         self.home.filesChanged.connect(self._go_tasks)
+        self.home.archiveRequested.connect(self._go_archive)
         self.task_page.backRequested.connect(
+            lambda: self.stack.setCurrentWidget(self.home))
+        self.archive_page.backRequested.connect(
             lambda: self.stack.setCurrentWidget(self.home))
         self.task_page.startRequested.connect(self._start)
         self.task_page.stop_btn.clicked.connect(self._stop)
@@ -1018,6 +1080,16 @@ class MainWindow(QMainWindow):
         self.stack.setCurrentWidget(self.task_page)
         if n:
             self.task_page.log(f"正在读取 {n} 个文件…")
+
+    def _go_archive(self):
+        paths = self.home.paths()
+        if not paths:
+            return
+        self.archive_page.set_files(paths)
+        self.home._clear()
+        self.stack.setCurrentWidget(self.archive_page)
+        self.archive_page.log_box.append(
+            f"已加入 {len(paths)} 个文件（探测中），配置后点「开始存档」")
 
     def _preload_preview_modules(self):
         """后台预载预览对话框的重依赖（cv2/QtMultimedia）：
