@@ -1,13 +1,15 @@
-# CrispFrame — AI 视频画质增强
+# CrispFrame — AI 视频画质增强 + 存档压缩
 
-超分 / 插帧 / 降噪 / 压缩伪影修复 / 人脸增强，一键批量处理。
+超分 / 插帧 / 降噪 / 压缩伪影修复 / 人脸增强，一键批量处理；
+**存档压缩**：SVT-AV1 恒定画质直通转码 + 编码后完整性自动验证（无需显卡）。
 本包为**免安装绿色版**：无需 Python，解压即用。
 
 ## 系统要求
 
 - Windows 10 / 11（64 位）
 - **NVIDIA 显卡（RTX 系列推荐）+ 最新显卡驱动**——AI 功能依赖 CUDA，
-  无 N 卡启动时会弹窗提示（本包不含 CPU 推理回退）
+  无 N 卡启动时会弹窗提示（本包不含 CPU 推理回退）；
+  **存档压缩功能不需要显卡**，纯 CPU 即可
 - 磁盘空间：包体约 10 GB，建议另留 10 GB 以上给输出文件与引擎缓存
 - 显存：4K 处理建议 12 GB+（1080p 素材 8 GB 可用）
 
@@ -16,16 +18,30 @@
 1. 解压到任意**本地磁盘**目录（不要放网络盘、压缩包内直接运行，也**不建议**
    放 `C:\Program Files`——引擎缓存需要写入包内 `models\engines\` 目录）
 2. 双击 `CrispFrame.exe`
-3. 首页拖入视频 → 添加模块（超分/插帧/降噪…）→ ⚙ 输出设置 → 开始处理
+3. 首页拖入视频后二选一：
+   - **下一步：配置任务 →**——AI 增强（超分/插帧/降噪…自由组合模块链，
+     含"平滑"模式：插帧+运动补偿混合，抹平 AI 生成内容的时域顿挫）
+   - **存档压缩 →**——纯压缩不改画质：SVT-AV1 直编（CPU 全核，性能与
+     命令行脚本一致），保留全部音轨/字幕/章节，输出容器可选（MKV/MP4/MOV/
+     AVI/TS 等 8 种 AV1 兼容格式），编码后自动做体积/元数据/全量解码
+     三项验证；**验证通过前请勿删除源片**
 
 **首次运行注意**：每个 AI 模型第一次使用时会在本机构建 TensorRT 加速引擎
 （约 1-3 分钟/模型，一次性），之后秒级加载。这是正常现象，不是卡死。
+存档压缩不涉及模型，无需等待。
 
 ## 命令行（可选）
 
 ```bat
 :: 快速档全功能（超分 + 2x 插帧，输出名自动带模块标签）
 runtime\python.exe app\gui.py --cli 输入视频.mp4 --model nomosuni --interp 2
+
+:: 平滑模式（三档：light / medium / heavy，默认 medium）
+runtime\python.exe app\gui.py --cli 输入视频.mp4 --smooth
+
+:: 存档压缩（编码后自动验证；--container 可选 mp4/mov/ts/asf 等）
+runtime\python.exe app\gui.py --cli 输入视频.mp4 --archive
+runtime\python.exe app\gui.py --cli --verify-only 成品.mkv 源片.mp4
 
 :: 查看模型清单与全部参数
 runtime\python.exe app\gui.py --cli --list-models
