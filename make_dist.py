@@ -20,7 +20,7 @@ ROOT = Path(__file__).resolve().parent
 STAGE = ROOT / "build" / "CrispFrame"
 RUNTIME = STAGE / "runtime"
 SITE = RUNTIME / "Lib" / "site-packages"
-VERSION = "1.1.0"
+VERSION = "1.2.0"
 
 APP_FILES = ["gui.py", "gui_preview.py", "archive_page.py", "compare_view.py"]
 
