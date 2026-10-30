@@ -13,7 +13,7 @@ import time
 from pathlib import Path
 
 from . import registry
-from .modules import StrengthBlend
+from .modules import StrengthBlend, effective_model, resolve_target
 from .ffutils import probe
 from .gpu_post import GpuPost
 from .sr import SuperRes
@@ -34,14 +34,24 @@ def _auto_batch(spec, width: int, height: int) -> int:
     return 4
 
 
+def _svt_preset(args) -> int:
+    """--preset 的 SVT 数字档解析（兼容 p 前缀写法），默认 4。"""
+    if args.preset is None:
+        return 4
+    p = args.preset[1:] if args.preset[:1] in ("p", "P") else args.preset
+    return max(1, min(13, int(p)))
+
+
 def build_stages(args, info) -> list:
     stages = []
     use_amp = not args.fp32
 
     def resolve_for(name):
         if name == "auto":
-            # 定版基线：真人 NomosUni 2x / 动漫 AnimeJaNai（与 GUI auto 一致）
-            name = "anime" if args.content == "anime" else "nomosuni"
+            # 与 GUI effective_model 同一逻辑：按 内容 + 目标高度/源高度 比例选型
+            #（--target-res x4 auto → 4x 系原生直出，而不是 2x + bicubic 上采）
+            name = effective_model({"model": "auto", "content": args.content,
+                                    "target_res": args.target_res}, info.height)
         return registry.resolve(name)
 
     if args.deh264 and args.deh264 > 0.005:   # 与 GUI build 的 ≤0.005 短路语义一致
@@ -67,13 +77,20 @@ def build_stages(args, info) -> list:
         stages.append(FaceEnhance(fidelity=args.face_w))
     if args.target_res or args.sharpen > 0:
         from .gpu_post import GpuPost
-        # 默认目标分辨率：SR 输出原分辨率（无 resize 时不做缩放）
-        w, _, h = (args.target_res or "").partition("x")
-        if not w:
+        if args.target_res:
+            # WxH = 缩放到固定尺寸；xN = 整数倍直出（等尺寸时 GpuPost 跳过缩放）
+            w_h = resolve_target(args.target_res, info.width, info.height)
+            if w_h is None or w_h[0] <= 0 or w_h[1] <= 0:
+                # build_stages 在 main 之外无法用 ap.error，SystemExit 同样干净退出
+                raise SystemExit(
+                    f"错误: 无法解析 --target-res {args.target_res!r}（支持 WxH 如 "
+                    f"3840x2160，或 x2/x4 整数倍直出）")
+        else:
+            # 未指定 target_res：跟随模型原生输出尺寸（与旧版行为一致）
             spec = resolve_for(args.model) if args.model != "off" else None
             scale = spec.scale if spec else 1
-            w, h = str(info.width * scale), str(info.height * scale)
-        stages.append(GpuPost(int(w), int(h), sharpen=args.sharpen))
+            w_h = (info.width * scale, info.height * scale)
+        stages.append(GpuPost(int(w_h[0]), int(w_h[1]), sharpen=args.sharpen))
     return stages
 
 
@@ -161,11 +178,11 @@ def main(argv=None) -> int:
                     help="平滑程度（配 --smooth）：light=当前帧主导 / "
                          "medium=180° 快门（默认，验收定版）/ heavy=最强平滑")
     ap.add_argument("--crf", type=int, default=None,
-                    help="感知质量：普通/平滑模式默认 28（NVENC cq 尺度）；"
-                         "--archive 用 SVT-AV1 crf 默认 30（25-27 稳/30 甜点/32 省）")
+                    help="感知质量：NVENC 默认 28（cq 尺度）；"
+                         "svtav1/archive 用 SVT-AV1 crf 默认 30（25-27 稳/30 甜点/32 省）")
     ap.add_argument("--preset", default=None,
-                    help="普通/平滑模式：NVENC 预设 p1-p7（默认 p5）；"
-                         "--archive：SVT-AV1 速度档 1-13（默认 4，越小越慢越省）")
+                    help="NVENC：预设 p1-p7（默认 p5）；"
+                         "svtav1/archive：速度档 1-13（默认 4，越小越慢越省）")
     ap.add_argument("--archive", action="store_true",
                     help="存档模式：直通转码（AI 增强参数不可用），SVT-AV1 恒定画质"
                          "（默认 crf30/preset4），全流保留（多音轨/字幕/章节），"
@@ -180,7 +197,10 @@ def main(argv=None) -> int:
     ap.add_argument("--verify-only", metavar="成品.mkv",
                     help="跳过编码，只对已有成品跑三项验证；此时位置参数可选作对照源"
                          "（python -m crispframe 源.mp4 --verify-only 成品.mkv）")
-    ap.add_argument("--encoder", default="av1_nvenc", choices=["av1_nvenc", "hevc_nvenc"])
+    ap.add_argument("--encoder", default="av1_nvenc",
+                    choices=["av1_nvenc", "hevc_nvenc", "svtav1"],
+                    help="输出编码器：NVENC 硬编（快、体积大、最大边 8192）或 "
+                         "svtav1 软编（慢、体积最优；大倍数直出超 8192 时必用）")
     ap.add_argument("--fp32", action="store_true", help="禁用 bf16 半精度（质量最优先）")
     ap.add_argument("--batch", type=int, default=0,
                     help="批处理帧数；0 = 自动（按输出分辨率：4K 取 1-2，低分辨率取 4-8）")
@@ -188,8 +208,9 @@ def main(argv=None) -> int:
     ap.add_argument("--face-w", type=float, default=0.8,
                     help="面部保真度 0-1：低=更'AI 修复'（细节多但可能改变五官内容），高=更保真（默认 0.8）")
     ap.add_argument("--target-res", default=None,
-                    help="输出分辨率 WxH（如 3840x2160）。SR 后先缩放到该分辨率再锐化——"
-                         "超必要分辨率交给播放器缩放会整体发软，建议对齐显示设备原生分辨率")
+                    help="输出分辨率 WxH（如 3840x2160）或整数倍直出 x2/x4"
+                         "（模型输出即最终输出，不缩放；×4 大分辨率源可达 8K）。"
+                         "默认跟随模型原生倍数输出")
     ap.add_argument("--sharpen", type=float, default=0,
                     help="unsharp 锐化幅度 0-2（SR 会放大源的运动模糊；0.6-1.0 可恢复商业软件式的'锐'观感）")
     ap.add_argument("--tone-match", action="store_true",
@@ -340,6 +361,28 @@ def main(argv=None) -> int:
         stages = build_stages(args, info)
         interpolator = build_interpolator(args, info)
         out_fps = info.fps * (2 if interpolator else 1)
+        # 编码器分辨率上限预检：NVENC 最大边 8192；SVT-AV1 的 8K+ 需 preset ≥5
+        if args.target_res:
+            tw, th = resolve_target(args.target_res, info.width, info.height) or (0, 0)
+        elif args.model != "off":
+            key = (effective_model({"model": "auto", "content": args.content,
+                                    "target_res": args.target_res}, info.height)
+                   if args.model == "auto" else args.model)
+            sc = registry.resolve(key).scale
+            tw, th = info.width * sc, info.height * sc
+        else:
+            tw, th = info.width, info.height
+        oversized = tw > 8192 or th > 8192
+        if oversized and args.encoder.endswith("_nvenc"):
+            print(f"错误: 输出 {tw}x{th} 超出 {args.encoder} 硬编上限（最大边 8192）——"
+                  f"请改用 SVT-AV1 软编（--encoder svtav1）或降低放大倍数。",
+                  file=sys.stderr)
+            return 2
+        if oversized and args.encoder == "svtav1" and _svt_preset(args) < 5:
+            print(f"错误: 输出 {tw}x{th}（8K+）要求 SVT-AV1 preset ≥5"
+                  f"（当前 {_svt_preset(args)}）——调高 --preset 或降低放大倍数。",
+                  file=sys.stderr)
+            return 2
         chain = " → ".join(
             [type(s).__name__ + (f"({getattr(s, 'spec').name})" if hasattr(s, "spec") else "") for s in stages]
             + ([type(interpolator).__name__] if interpolator else [])
@@ -351,11 +394,25 @@ def main(argv=None) -> int:
             print(f"输出: {out_path}  ({out_fps:.3f}fps, {args.encoder} cq{args.crf or 28})")
 
         t0 = time.perf_counter()
+        if args.smooth:
+            encode = _smooth_encode(info, args.smooth_level)   # 平滑锁定定版编码配方
+        elif args.encoder == "svtav1":
+            # 软编路径：编码参数走 CodecSettings（大倍数直出超 NVENC 8192 上限时必用）
+            cs = CodecSettings()
+            spec = cs.spec()
+            cs.crf = (max(spec.crf_range[0], min(spec.crf_range[1], args.crf))
+                      if args.crf is not None else 30)
+            cs.preset = _svt_preset(args)
+            encode = EncodeConfig(**build_encode_config_kwargs(
+                cs, info.fps, interpolator is not None))
+        else:
+            encode = EncodeConfig(
+                encoder=args.encoder,
+                crf=args.crf if args.crf is not None else 28,
+                preset=args.preset or "p5")
         stats = run(
             info, out_path, stages=stages, interpolator=interpolator,
-            encode=_smooth_encode(info, args.smooth_level) if args.smooth else
-            EncodeConfig(encoder=args.encoder, crf=args.crf if args.crf is not None else 28,
-                         preset=args.preset or "p5"),
+            encode=encode,
             batch_size=args.batch, max_seconds=args.max_seconds,
         )
         size_mb = out_path.stat().st_size / 1e6

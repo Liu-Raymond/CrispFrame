@@ -65,6 +65,7 @@ winget install --id Gyan.FFmpeg -e
 # 4) 运行
 python gui.py                       # GUI
 python -m crispframe 输入.mp4 --tone-match --sharpen 0.6 --target-res 3840x2160
+python -m crispframe 输入.mp4 --target-res x2              # 整数倍直出（模型输出不缩放）
 python -m crispframe 输入.mp4 --content anime --interp 2   # 动漫 + 2x 插帧
 python -m crispframe --list-models  # 查看模型清单与全部参数
 ```

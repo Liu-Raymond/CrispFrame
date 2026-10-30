@@ -58,7 +58,8 @@ class BuildContext:
     use_trt: bool = True
     use_amp: bool = True
     compile_model: bool = False
-    upstream_scale: int = 1       # 链上超分模块的放大倍数，build_chain 填充（插帧 auto 尺度用）
+    upstream_scale: float = 1.0   # 链上超分模块的输出高度/源高度（可为 <1 的缩小档），
+    # build_chain 按最终输出分辨率填充；插帧/平滑 auto 尺度判定 = 源高×此值（即实际处理高度）
 
 
 @dataclass
@@ -220,18 +221,47 @@ _TARGET_CHOICES = [
     ("3840x2160（4K UHD·推荐）", "3840x2160"),
     ("2560x1440（2K QHD）", "2560x1440"),
     ("1920x1080（FHD）", "1920x1080"),
+    ("2x（源×2 直出）", "x2"),
+    ("4x（源×4 直出）", "x4"),
     ("与源相同（仅增强不放大）", ""),
 ]
 _TARGET_DISPLAY = {v: d for d, v in _TARGET_CHOICES}
-_TARGET_SHORT = {"3840x2160": "4K", "2560x1440": "2K", "1920x1080": "1080p", "": "与源相同"}
+_TARGET_SHORT = {"3840x2160": "4K", "2560x1440": "2K", "1920x1080": "1080p",
+                 "x2": "2x直出", "x4": "4x直出", "": "与源相同"}
 _TARGET_H = {"3840x2160": 2160, "2560x1440": 1440, "1920x1080": 1080}
+
+
+def resolve_target(target_res: str, src_w: int, src_h: int) -> tuple[int, int] | None:
+    """目标分辨率统一解析（build/摘要/GUI 共用）：
+    "xN" → 源×N 整数倍直出；"WxH" → 固定尺寸；空 → None（与源相同）。"""
+    t = str(target_res or "")
+    tl = t.lower()
+    if tl.startswith("x") and tl[1:].isdigit():
+        n = int(tl[1:])
+        return src_w * n, src_h * n
+    w, _, h = tl.partition("x")
+    if w.isdigit() and h.isdigit():
+        return int(w), int(h)
+    return None
+
+
+def target_scale(target_res: str, src_h: int) -> int:
+    """源 → 最终输出的总放大倍数（整数近似）。仅诊断/展示用；
+    插帧 auto 尺度判定走 build_chain 的真实输出高度比（upstream_scale）。"""
+    t = str(target_res or "")
+    if t.startswith("x") and t[1:].isdigit():
+        return int(t[1:])
+    if src_h > 0 and t.lower().partition("x")[2].isdigit():
+        return max(1, int(t.lower().partition("x")[2]) // src_h)
+    return 1
 
 
 def effective_model(params: dict, source_h: int = 0) -> str:
     """解析超分实际使用的模型键。
 
     显式指定优先；auto 按 目标高度/源高度 比例选：≤2.5 用 2x 系（一步到位），
-    更大用 4x 系（2x 不够高，如 720p→4K 比例 3）。动漫目前仅 2x 系模型。
+    更大用 4x 系（2x 不够高，如 720p→4K 比例 3）。倍数档（x2/x4）按倍数折算
+    目标高度走同一比例逻辑；动漫目前仅 2x 系模型（x4 时 2x 增强 + bicubic 上采）。
     """
     key = str(params.get("model", "auto"))
     if key != "auto":
@@ -239,7 +269,13 @@ def effective_model(params: dict, source_h: int = 0) -> str:
     content = str(params.get("content", "real"))
     if content == "anime":
         return "anime"
-    target_h = _TARGET_H.get(str(params.get("target_res") or ""))
+    target_res = str(params.get("target_res") or "")
+    if target_res.startswith("x") and target_res[1:].isdigit():
+        target_h = source_h * int(target_res[1:]) if source_h > 0 else None
+    else:
+        h_part = target_res.lower().partition("x")[2]
+        target_h = (int(h_part) if h_part.isdigit()      # 任意 WxH 都按高度比例选
+                    else _TARGET_H.get(target_res))
     if target_h is None or source_h <= 0:   # 与源相同 / 源未知 → 2x 系
         return "nomosuni"
     return "nomosuni" if target_h / source_h <= 2.5 else "nomos8k-weak"
@@ -258,7 +294,9 @@ class _SuperResSpec(ModuleSpec):
                           tip="决定自动模型从哪个系列选"),
                 ParamSpec("target_res", "目标分辨率", "choice", "3840x2160", _TARGET_CHOICES,
                           tip="建议对齐显示设备原生分辨率；目标高度超过源 2.5 倍时"
-                              "自动换 4x 模型（如 720p→4K）"),
+                              "自动换 4x 模型（如 720p→4K）。x2/x4 = 整数倍直出："
+                              "模型输出即最终输出（不缩放）。注意 ×4 的输出是源的 4 倍"
+                              "（1440p 源→8K 内可行；4K 源×4=16K 会显存不足，勿用）"),
                 ParamSpec("sharpen", "锐化补偿", "float", 0.6,
                           min=0, max=2, step=0.1,
                           tip="0.4-0.6 合适区间，1.0 以上易过头"),
@@ -273,10 +311,11 @@ class _SuperResSpec(ModuleSpec):
         from .gpu_post import GpuPost
         spec = registry.resolve(effective_model(params, ctx.height))
         stages = [_make_sr(spec, ctx, tone_match=bool(params["tone_match"]))]
-        if params["target_res"]:
-            w, _, h = str(params["target_res"]).partition("x")
-        else:  # 与源相同：模型放大后再缩回，仅取增强效果
+        w_h = resolve_target(params["target_res"], ctx.width, ctx.height)
+        if w_h is None:  # 与源相同：模型放大后再缩回，仅取增强效果
             w, h = ctx.width, ctx.height
+        else:
+            w, h = w_h   # 固定尺寸或 xN 直出（等尺寸时 GpuPost 自动跳过缩放）
         stages.append(GpuPost(int(w), int(h), sharpen=float(params["sharpen"])))
         return BuiltModule(stages=stages)
 
@@ -287,7 +326,13 @@ class _SuperResSpec(ModuleSpec):
             model_disp = _SR_DISPLAY.get(effective_model(params, src_h),
                                          effective_model(params, src_h)).split("（")[0]
         content = "动漫" if params["content"] == "anime" else "真人"
-        target = _TARGET_SHORT.get(params["target_res"], params["target_res"])
+        tr = str(params["target_res"])
+        if tr.startswith("x") and tr[1:].isdigit():
+            n = int(tr[1:])
+            target = (f"{_TARGET_SHORT.get(tr, tr)}"
+                      + (f"·{src_h * n}p" if src_h > 0 else ""))
+        else:
+            target = _TARGET_SHORT.get(tr, tr)
         return f"{content} · {model_disp} · {target} · 锐化{params['sharpen']:.1f}"
 
 
@@ -415,12 +460,15 @@ def build_chain(instances: list[ModuleInstance],
     """实例链 → (stages, interpolator, vf_pre)。禁用模块跳过；时序模块提取为
     interpolator，其编码侧前置滤镜（混合+回采）经 vf_pre 交给 codec。"""
     ordered = sorted(instances, key=lambda m: m.spec.order)
-    # 插帧 auto 尺度需要知道上游超分的实际放大倍数（目标高度/源高度）
+    # 插帧 auto 尺度判定依据 = 插帧实际处理的高度（超分最终输出高度）÷ 源高。
+    # 用真实输出高度比而非整数倍：2160p 源选 1080p 缩小档时比值 0.5，
+    # 按处理高度 1080 判定应用标准模式（1.0）而非 UHD（0.5）
     for inst in ordered:
         if inst.enabled and inst.key == "sr":
-            target = str(inst.params["target_res"] or "")
-            ctx.upstream_scale = (int(target.partition("x")[2]) // ctx.height
-                                  if target else 1)
+            w_h = resolve_target(str(inst.params["target_res"] or ""),
+                                 ctx.width, ctx.height)
+            out_h = w_h[1] if w_h else ctx.height
+            ctx.upstream_scale = (out_h / ctx.height) if ctx.height else 1.0
             break
     stages: list = []
     interpolator = None

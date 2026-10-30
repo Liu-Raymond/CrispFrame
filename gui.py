@@ -112,11 +112,12 @@ class Task:
                 return int(w), int(h)
         for m in self.enabled_modules():
             if m.key == "sr":
-                target = str(m.params["target_res"] or "")
-                if target:
-                    w, _, h = target.partition("x")
-                    return int(w), int(h)
-                return self.info.width, self.info.height
+                from crispframe.modules import resolve_target
+                w_h = resolve_target(str(m.params["target_res"] or ""),
+                                     self.info.width, self.info.height)
+                if w_h is None:
+                    return self.info.width, self.info.height
+                return w_h
         return self.info.width, self.info.height
 
     def out_fps_value(self) -> float:
@@ -186,6 +187,22 @@ class Worker(QThread):
         self.log.emit(f"▶ {task.src.name}")
         out = task.out_path()
         out.parent.mkdir(parents=True, exist_ok=True)
+        # 编码器分辨率上限预检：NVENC 最大边 8192；SVT-AV1 的 8K+ 需 preset ≥5
+        ow, oh = task.out_size()
+        oversized = ow > 8192 or oh > 8192
+        if oversized and task.codec_settings.spec().draft:
+            msg = (f"输出 {ow}x{oh} 超出 {task.codec_settings.encoder} 硬编上限"
+                   f"（最大边 8192）——请改用 SVT-AV1 软编或降低放大倍数")
+            self.log.emit(f"[跳过] {msg}")
+            self.taskDone.emit(task, False, msg)
+            return False
+        if (oversized and task.codec_settings.encoder == "svtav1"
+                and task.codec_settings.preset < 5):
+            msg = (f"输出 {ow}x{oh}（8K+）要求 SVT-AV1 preset ≥5"
+                   f"（当前 {task.codec_settings.preset}）——请在输出设置调高 preset")
+            self.log.emit(f"[跳过] {msg}")
+            self.taskDone.emit(task, False, msg)
+            return False
         ctx = BuildContext(width=task.info.width, height=task.info.height,
                            fps=task.info.fps)
         stages, interp, vf_pre = modules.build_chain(task.modules, ctx)
