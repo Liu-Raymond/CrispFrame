@@ -15,6 +15,7 @@ from __future__ import annotations
 import json
 import subprocess
 import threading
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -48,14 +49,36 @@ class VerifyResult:
 
 
 def probe_stream_meta(path: Path) -> dict:
-    """视频流元数据：width/height/r_frame_rate(原始字符串)/pix_fmt。"""
-    out = subprocess.run(
-        [ffprobe(), "-v", "error", "-select_streams", "v:0",
-         "-show_entries", "stream=width,height,r_frame_rate,pix_fmt",
-         "-of", "json", str(path)],
-        capture_output=True, text=True, **SUBPROC_FLAGS,
-    ).stdout
-    return json.loads(out)["streams"][0]
+    """视频流元数据：width/height/r_frame_rate(原始字符串)/pix_fmt。
+
+    瞬时失败（来源程序占用文件的间歇句柄）重试 2 次——与 ffutils.probe 同策略。"""
+    path = Path(path)
+    if not path.exists():
+        raise ValueError(f"文件不存在或已被移动/删除：{path}")
+    last: Exception | None = None
+    for _ in range(3):
+        try:
+            out = subprocess.run(
+                [ffprobe(), "-v", "error", "-select_streams", "v:0",
+                 "-show_entries", "stream=width,height,r_frame_rate,pix_fmt",
+                 "-of", "json", str(path)],
+                capture_output=True, text=True, **SUBPROC_FLAGS,
+            ).stdout
+            streams = json.loads(out).get("streams") or []
+            if not streams:
+                raise KeyError("streams")
+            return streams[0]
+        except (subprocess.CalledProcessError, json.JSONDecodeError,
+                KeyError, IndexError) as e:
+            last = e
+            time.sleep(0.4)
+    if isinstance(last, KeyError):
+        raise ValueError(
+            f"暂时无法读取视频流（已重试）：文件可能正被其他程序占用，稍后重试即可；"
+            f"若持续出现，则文件可能没有视频轨或已损坏（{path.name}）")
+    raise ValueError(
+        f"无法读取视频流：文件可能没有视频轨、已损坏，"
+        f"或不是本工具支持的封装（{path.name}）") from last
 
 
 def _probe_duration(path: Path) -> float:
