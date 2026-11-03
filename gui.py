@@ -187,7 +187,7 @@ class Worker(QThread):
         self.log.emit(f"▶ {task.src.name}")
         out = task.out_path()
         out.parent.mkdir(parents=True, exist_ok=True)
-        # 编码器分辨率上限预检：NVENC 最大边 8192；SVT-AV1 的 8K+ 需 preset ≥5
+        # 编码器分辨率上限预检：NVENC 最大边 8192；SVT-AV1 的 8K 级面积阈值需 preset ≥5
         ow, oh = task.out_size()
         oversized = ow > 8192 or oh > 8192
         if oversized and task.codec_settings.spec().draft:
@@ -196,10 +196,11 @@ class Worker(QThread):
             self.log.emit(f"[跳过] {msg}")
             self.taskDone.emit(task, False, msg)
             return False
-        if (oversized and task.codec_settings.encoder == "svtav1"
-                and task.codec_settings.preset < 5):
-            msg = (f"输出 {ow}x{oh}（8K+）要求 SVT-AV1 preset ≥5"
-                   f"（当前 {task.codec_settings.preset}）——请在输出设置调高 preset")
+        if (task.codec_settings.encoder == "svtav1"
+                and codec.svtav1_fix_preset(task.codec_settings.preset, ow, oh)[1]):
+            msg = (f"输出 {ow}x{oh} 为 8K 级分辨率，SVT-AV1 拒绝 "
+                   f"preset {task.codec_settings.preset}（要求 ≥5）"
+                   f"——请在输出设置调高 preset 或降低放大倍数")
             self.log.emit(f"[跳过] {msg}")
             self.taskDone.emit(task, False, msg)
             return False

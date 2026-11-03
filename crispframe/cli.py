@@ -18,7 +18,8 @@ from .ffutils import probe
 from .gpu_post import GpuPost
 from .sr import SuperRes
 from .codec import (available_containers, VIDEO_CONTAINERS, CodecSettings,
-                    build_encode_config_kwargs)
+                    build_encode_config_kwargs, is_svt_8k_error,
+                    svtav1_fix_preset)
 from .pipeline import EncodeConfig, PassthroughCanceled, run, run_passthrough
 from .verify import human_size, probe_stream_meta, verify_output
 
@@ -329,22 +330,41 @@ def main(argv=None) -> int:
 
     if args.archive:
         verify_tag = "编码后自动验证" if not args.no_verify else "验证已跳过"
+        # 8K 级分辨率（面积阈值见 codec.SVT_8K_AREA）SVT 拒绝 preset<5，主动上调
+        svt_fixed, svt_bumped = svtav1_fix_preset(cs_archive.preset,
+                                                  info.width, info.height)
+        if svt_bumped:
+            cs_archive.preset = svt_fixed
+            print(f"提示: {info.width}x{info.height} 为 8K 级分辨率，"
+                  f"SVT-AV1 自动上调 preset{cs_archive.preset}")
         print(f"存档模式: 单进程直编 SVT-AV1 crf{cs_archive.crf}/preset{cs_archive.preset}"
               f"，全流保留（多音轨/字幕/章节），色彩/时基跟随源，{verify_tag}")
-        encode = EncodeConfig(**build_encode_config_kwargs(
-            cs_archive, info.fps, False, map_all=True))
         t0 = time.perf_counter()
         try:
-            run_passthrough(info, out_path, encode=encode,
-                            progress_callback=lambda d, t: print(
-                                f"\r编码进度 {d:.0f}/{t:.0f}s", end="", flush=True),
-                            cancel_check=None)
+            for attempt in range(2):
+                encode = EncodeConfig(**build_encode_config_kwargs(
+                    cs_archive, info.fps, False, map_all=True))
+                try:
+                    run_passthrough(info, out_path, encode=encode,
+                                    progress_callback=lambda d, t: print(
+                                        f"\r编码进度 {d:.0f}/{t:.0f}s", end="", flush=True),
+                                    cancel_check=None)
+                    break
+                except PassthroughCanceled:
+                    raise
+                except Exception as e:
+                    # 编码失败：残件顶着最终存档命名落盘有误归档风险（下次需 --force），删除之
+                    out_path.unlink(missing_ok=True)
+                    if attempt == 0 and cs_archive.preset < 5 and is_svt_8k_error(str(e)):
+                        print(f"\n提示: SVT 拒绝该分辨率的 preset{cs_archive.preset}"
+                              f"（8K 级限制），自动改用 preset5 重试")
+                        cs_archive.preset = 5
+                        continue
+                    raise
         except PassthroughCanceled:
             print("\n已取消")
             return 130
         except Exception as e:
-            # 编码失败：残件顶着最终存档命名落盘有误归档风险（下次需 --force），删除之
-            out_path.unlink(missing_ok=True)
             print(f"\n[错误] 编码失败（残缺产物已删除，源片保留）: {str(e)[:500]}",
                   file=sys.stderr)
             return 1
@@ -361,7 +381,7 @@ def main(argv=None) -> int:
         stages = build_stages(args, info)
         interpolator = build_interpolator(args, info)
         out_fps = info.fps * (2 if interpolator else 1)
-        # 编码器分辨率上限预检：NVENC 最大边 8192；SVT-AV1 的 8K+ 需 preset ≥5
+        # 编码器分辨率上限预检：NVENC 最大边 8192；SVT-AV1 的 8K 级面积阈值需 preset ≥5
         if args.target_res:
             tw, th = resolve_target(args.target_res, info.width, info.height) or (0, 0)
         elif args.model != "off":
@@ -378,11 +398,14 @@ def main(argv=None) -> int:
                   f"请改用 SVT-AV1 软编（--encoder svtav1）或降低放大倍数。",
                   file=sys.stderr)
             return 2
-        if oversized and args.encoder == "svtav1" and _svt_preset(args) < 5:
-            print(f"错误: 输出 {tw}x{th}（8K+）要求 SVT-AV1 preset ≥5"
-                  f"（当前 {_svt_preset(args)}）——调高 --preset 或降低放大倍数。",
-                  file=sys.stderr)
-            return 2
+        if args.encoder == "svtav1":
+            _, svt_bumped = svtav1_fix_preset(_svt_preset(args), tw, th)
+            if svt_bumped:
+                print(f"错误: 输出 {tw}x{th} 为 8K 级分辨率，SVT-AV1 拒绝 "
+                      f"preset {_svt_preset(args)}（要求 ≥5）——"
+                      f"调高 --preset 或降低放大倍数。",
+                      file=sys.stderr)
+                return 2
         chain = " → ".join(
             [type(s).__name__ + (f"({getattr(s, 'spec').name})" if hasattr(s, "spec") else "") for s in stages]
             + ([type(interpolator).__name__] if interpolator else [])

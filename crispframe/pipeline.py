@@ -145,10 +145,12 @@ def run_passthrough(
     err_holder: list[str] = []
 
     def drain_errors():
-        # SVT 的 info banner（约 17 行）会占满截断额度、淹掉真正的 ffmpeg
-        # 错误（在 stderr 末尾），直接不收集
+        # SVT 的 info/warn banner（约 17 行）会占满截断额度、淹掉真正的 ffmpeg
+        # 错误（在 stderr 末尾），不收集；但 Svt[error] 行是唯一精确的诊断标志
+        #（如 8K 级 preset 限制 "limited to M5"），必须保留
         err_holder.extend(line.rstrip() for line in proc.stderr
-                          if line.strip() and not line.lstrip().startswith("Svt["))
+                          if line.strip()
+                          and not line.lstrip().startswith(("Svt[info", "Svt[warn")))
 
     t = threading.Thread(target=drain_errors, daemon=True)
     t.start()

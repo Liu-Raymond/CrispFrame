@@ -22,7 +22,8 @@ from PySide6.QtWidgets import (QHBoxLayout, QLabel, QListWidget, QComboBox,
 
 from crispframe.codec import (VIDEO_CONTAINERS, available_containers,
                               archive_pix_fmt, CodecSettings,
-                              build_encode_config_kwargs)
+                              build_encode_config_kwargs,
+                              is_svt_8k_error, svtav1_fix_preset)
 from crispframe.ffutils import VideoInfo, probe
 from crispframe.pipeline import EncodeConfig, PassthroughCanceled, run_passthrough
 from crispframe.verify import human_size, probe_stream_meta, verify_output
@@ -81,11 +82,44 @@ class ArchiveWorker(QThread):
         else:
             self.allDone.emit(ok_all, "全部完成" if ok_all else "有文件未完成存档")
 
+    def _encode_selfheal(self, src: Path, info: VideoInfo, out: Path,
+                         cs: CodecSettings) -> str:
+        """单进程直编（全流），含 SVT 8K preset 自愈重试。
+
+        返回 'ok' / 'cancel' / 错误消息。失败即删残件：SVT 拒绝 8K 级分辨率的
+        preset<5 时按报错标志自动上调 preset5 重试一次（主动阈值外的边界形状）。"""
+        for attempt in range(2):
+            encode = EncodeConfig(**build_encode_config_kwargs(
+                cs, info.fps, False, map_all=True))
+            try:
+                run_passthrough(info, out, encode=encode,
+                                progress_callback=lambda dn, t: self.taskProgress.emit(
+                                    src.name, int(dn), int(t)),
+                                cancel_check=lambda: self._cancel)
+                return "ok"
+            except PassthroughCanceled:
+                out.unlink(missing_ok=True)
+                self.log.emit(f"  {src.name}: 已取消，残缺产物已删除")
+                return "cancel"
+            except Exception as e:  # noqa: BLE001
+                out.unlink(missing_ok=True)
+                if attempt == 0 and cs.preset < 5 and is_svt_8k_error(str(e)):
+                    self.log.emit(f"⚠ {src.name}: SVT 拒绝该分辨率的 "
+                                  f"preset{cs.preset}（8K 级限制），自动改用 preset5 重试")
+                    cs.preset = 5
+                    continue
+                self.log.emit(f"[错误] {src.name}: {e}")
+                return f"编码失败: {str(e)[:120]}"
+        return "编码失败"
+
     def _process_one(self, src: Path, info: VideoInfo) -> bool:
         """单文件：预检 → 单进程直编（全流）→ 三项验证。失败/取消删产物。"""
         cs = CodecSettings()              # 定版基线：svtav1 / preset4 / matroska / 10bit
         cs.crf = self.crf
         cs.container = self.container
+        # 8K 级分辨率（面积阈值见 codec.SVT_8K_AREA）SVT 拒绝 preset4，主动上调
+        cs.preset, preset_bumped = svtav1_fix_preset(cs.preset,
+                                                     info.width, info.height)
         ext = VIDEO_CONTAINERS[self.container]["ext"]
         out = src.with_name(f"{src.stem}.cf.archive-crf{self.crf}{ext}")
         if out.exists():
@@ -109,29 +143,19 @@ class ArchiveWorker(QThread):
             self.log.emit(f"⚠ {src.name}: 输出盘剩余 {human_size(free)}，"
                           f"建议至少留源片体积 25% 的余量")
 
-        encode = EncodeConfig(**build_encode_config_kwargs(
-            cs, info.fps, False, map_all=True))
         cont_label = VIDEO_CONTAINERS[self.container]["label"]
         self.log.emit(f"▶ {src.name}: {info.width}x{info.height}@{info.fps:.3f} "
-                      f"SVT-AV1 crf{cs.crf}/preset4 → {cont_label.split('（')[0]}"
+                      f"SVT-AV1 crf{cs.crf}/preset{cs.preset}"
+                      f"{'（8K 级自动上调）' if preset_bumped else ''} → "
+                      f"{cont_label.split('（')[0]}"
                       f"（单进程直编，全流保留，色彩/时基跟随源），完成后自动验证")
         t0 = time.perf_counter()
-        try:
-            run_passthrough(info, out, encode=encode,
-                            progress_callback=lambda dn, t: self.taskProgress.emit(
-                                src.name, int(dn), int(t)),
-                            cancel_check=lambda: self._cancel)
-        except PassthroughCanceled:
-            out.unlink(missing_ok=True)
-            self.log.emit(f"  {src.name}: 已取消，残缺产物已删除")
-            self.fileDone.emit(src.name, False, "已取消")
-            return False
-        except Exception as e:
-            # 编码失败：残件顶着最终存档命名落盘会卡死重跑（覆盖跳过），删除之
-            out.unlink(missing_ok=True)
-            self.log.emit(f"[错误] {src.name}: {e}")
-            self.log.emit("  编码失败的残缺产物已删除（源片保留）")
-            self.fileDone.emit(src.name, False, f"编码失败: {str(e)[:120]}")
+        result = self._encode_selfheal(src, info, out, cs)
+        if result != "ok":
+            if result != "cancel":
+                self.log.emit("  编码失败的残缺产物已删除（源片保留）")
+            self.fileDone.emit(src.name, False,
+                               "已取消" if result == "cancel" else result)
             return False
         self.log.emit(f"✓ {out.name}  编码 {time.perf_counter() - t0:.0f}s / "
                       f"{human_size(out.stat().st_size)}")

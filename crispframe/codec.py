@@ -139,6 +139,34 @@ def archive_pix_fmt(src_pix: str) -> tuple[int, str] | None:
     return _ARCHIVE_PIX_MAP.get(src_pix)
 
 
+# ---------------------------------------------------------------------------
+# SVT-AV1 的 8K 级 preset 限制（2026-11-04 实测钉界）
+# preset4 拒绝域：7104x4312 / 7680x2880(22.1M) / 6000x4000 / 7680x4320；
+# 通过域：4320x2880 / 5120x2880 / 7104x2880(20.5M) / 3840x4312 / 7680x1080。
+# 结论：面积制（宽高需同时大：单边超不触发），阈值在 20.5M~22.1M 之间，
+# ffmpeg 报 "Error setting encoder parameters: bad parameter (0x80001005)"，
+# SVT 明示 "8k+ resolution support is limited to M5 and faster presets"。
+# 阈值取保守 20M（≈5000x4000）：绝不漏拒（宁可多升档——preset5 只是更慢些）。
+SVT_8K_AREA = 20_000_000
+
+
+def svtav1_fix_preset(preset: int, width: int, height: int) -> tuple[int, bool]:
+    """8K 级分辨率（面积 ≥ SVT_8K_AREA）SVT-AV1 拒绝 preset<5：
+    返回 (修正后 preset, 是否上调)；preset≥5 原样返回。"""
+    if preset < 5 and width * height >= SVT_8K_AREA:
+        return 5, True
+    return preset, False
+
+
+def is_svt_8k_error(msg: str) -> bool:
+    """SVT 8K preset 拒绝的报错特征。两道标志：SVT 原生行（pipeline 的
+    stderr 收集保留 Svt[error] 行）与 ffmpeg 包装层的 libsvtav1 bad parameter
+    （bad parameter 本身泛化，须与 libsvtav1 同现才判）。"""
+    m = msg.lower()
+    return ("limited to m5" in m or "8k+ resolution support" in m
+            or ("libsvtav1" in m and "bad parameter" in m))
+
+
 @dataclass
 class EncoderSpec:
     key: str                     # 设置键（ENCODERS 字典键 / CodecSettings.encoder）
