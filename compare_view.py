@@ -2,13 +2,16 @@
 
 - 槽位选择：视频1/视频2 两个下拉（原片固定 + A/B/C 渲染位），可一键交换
 - 视频对比走原生 QVideoWidget（GPU 合成，全帧率全分辨率，60fps/4K 无压力）：
-  · 擦除：两路同位叠加，顶层 widget 用 QRegion mask 裁到分割线左侧，
-    分割线跟随鼠标（左=视频2，右=视频1；扫到最右全是视频2，最左全是视频1）
+  · 擦除：两路同位叠加，左右各裁到分割缝隙边缘——缝隙谁也不画，即线本身
+    （页面背景画暗底 + 1 屏幕像素亮芯；左=视频2，右=视频1；扫到最右全是视频2，
+    最左全是视频1），无任何浮层窗口
   · 并排：左右各一个 QVideoWidget
+  · 缩放：滚轮缩放（光标锚点）——两路几何按 30ms 合并重配置（4K 原生呈现面
+    重配置实测 ~13ms/次，节流后流畅，不再逐 tick 堆积卡死），拖拽平移即时跟手
 - 图片对比（渲染此帧）：图形场景像素级对比，支持擦除/并排/缩放
-- 视频同步：双 QMediaPlayer 内容偏移对齐（250ms 检查），视频1 出声、视频2 静音；
+- 视频同步：双 QMediaPlayer 内容偏移对齐（250ms 检查），默认静音、🔊 可开；
   混选（一帧一段）时把视频侧取一帧转成图片对比
-- 静帧细节对比：暂停后扫动擦除；像素级放大用「渲染此帧」+ 槽位图片对比
+- 静帧细节对比：暂停后扫动擦除 + 滚轮缩放；像素级放大用「渲染此帧」+ 槽位图片对比
 - 全屏：按钮 / 双击 / F11，Esc 先退全屏再关对话框
 """
 from __future__ import annotations
@@ -16,8 +19,8 @@ from __future__ import annotations
 import time
 from pathlib import Path
 
-from PySide6.QtCore import QEventLoop, QPoint, QPointF, QRectF, Qt, QTimer, Signal
-from PySide6.QtGui import QGuiApplication, QColor, QPainter, QPen, QPixmap, QRegion, QTransform
+from PySide6.QtCore import QEventLoop, QPointF, QRect, QRectF, Qt, QTimer, Signal
+from PySide6.QtGui import QColor, QPainter, QPen, QPixmap, QRegion, QTransform
 from PySide6.QtMultimedia import QAudioOutput, QMediaPlayer
 from PySide6.QtMultimediaWidgets import QVideoWidget
 from PySide6.QtWidgets import (
@@ -93,15 +96,22 @@ class _CompareView(QGraphicsView):
 
 
 class _VideoPage(QWidget):
-    """原生视频对比页：擦除（顶层 mask）或并排。悬停驱动分割线，GPU 合成零转换成本。
+    """原生视频对比页：擦除（双侧 mask 真缝隙）或并排。悬停驱动分割。
 
-    实时缩放：滚轮缩放（光标锚点）+ 左键拖拽平移——把 QVideoWidget 的几何
-    放大 z 倍并负偏移，父级裁剪溢出，视频内容由 GPU 等比放大，无 CPU 成本。
-    播放中即可用，无需暂停（像素级精查走「渲染此帧」槽位图片对比）。
+    分割线 = 左右两路在分割处各让出 SEAM_PX 屏幕像素、谁也不画——缝隙露出页面
+    背景（paintEvent 画暗底 + 1 屏幕像素亮芯）就是线本身，即画面的真实分界，
+    没有任何浮层盖在视频上（旧方案的置顶 Tool 线窗已删）。
+
+    缩放 = 调整两路 QVideoWidget 几何（原生呈现面重配置，实测 4K 单次 ~13ms），
+    防抖合并：首次滚轮立即应用，手势连发的后续 tick 进 GEOM_COALESCE_MS
+    冷却窗，末次 tick 后 30ms 应用最终值——不再逐 tick 堆积导致 UI 卡死。
+    平移是同尺寸移位（无重配置）即时应用。
+    播放中即可用（像素级精查走「渲染此帧」槽位图片对比）。
     """
     splitMoved = Signal(float)
-    layoutChanged = Signal()             # 遮罩边缘可能移动（缩放/平移/尺寸变化）
     MAX_ZOOM = 8.0
+    SEAM_PX = 3.0                 # 分割缝隙宽度（屏幕像素，不随缩放变化）
+    GEOM_COALESCE_MS = 30         # 滚轮缩放的几何合并间隔
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -109,89 +119,124 @@ class _VideoPage(QWidget):
         self.mode = "wipe"
         self.split = 0.5
         self.zoom = 1.0
-        self.pan = QPointF(0.0, 0.0)          # 容器像素（当前 zoom 下）
+        self.pan = QPointF(0.0, 0.0)          # 页面坐标下的平移量（当前 zoom 下）
         self._drag = None                     # (press_pos, pan_at_press)
-        self._last_layout_key = None
-        self.w1 = QVideoWidget(self)          # 视频1（擦除时在底层，显示右半）
-        self.w2 = QVideoWidget(self)          # 视频2（擦除时在顶层，mask 裁左半）
+        self._geom_timer = QTimer(self)       # 滚轮/程序缩放的几何合并
+        self._geom_timer.setSingleShot(True)
+        self._geom_timer.setInterval(self.GEOM_COALESCE_MS)
+        self._geom_timer.timeout.connect(self._apply_geometry)
+        self._last_apply_ms = 0.0
+        self.w1 = QVideoWidget(self)          # 视频1（擦除时显示右半）
+        self.w2 = QVideoWidget(self)          # 视频2（擦除时显示左半）
         # 鼠标事件全部交给页面（悬停擦除/滚轮缩放/拖拽平移），视频件不消费
         for w in (self.w1, self.w2):
             w.setAttribute(Qt.WA_TransparentForMouseEvents, True)
-        # 分割线不再由本页管理：QVideoWidget 的视频呈现面会盖住同窗树内的一切
-        # 兄弟/子窗口（z 序抢不过），独立 Tool 窗的坐标簿记也不可信——最终方案是
-        # 无父窗口的置顶 Tool 窗，由 CompareDialog 按遮罩边缘的全局逻辑坐标维护
-        self.line = None
 
     # —— 布局 ——
-    def _base_rects(self):
-        W, H = max(self.width(), 1), max(self.height(), 1)
-        if self.mode == "wipe":
-            return QRectF(0, 0, W, H), QRectF(0, 0, W, H)
-        gap = round(W * GAP_RATIO)
-        left_w = (W - gap) // 2
-        return QRectF(0, 0, left_w, H), QRectF(left_w + gap, 0, W - left_w - gap, H)
+    def paintEvent(self, ev):
+        """页面底色 + 分割缝隙（缝隙 = 线本身；视频 mask 让出的区域露在这里）。
+
+        本页面是无变换 QWidget：paintEvent/mask 坐标就是屏幕逻辑像素，
+        缝宽为屏幕常量 SEAM_PX，不随缩放变化（8x 精查时依旧可见）。"""
+        p = QPainter(self)
+        p.fillRect(self.rect(), QColor("#101014"))
+        if self.mode == "wipe" and self.width() > 0:
+            cx = self.width() * self.split
+            half = self.SEAM_PX / 2.0                  # 缝隙半宽（屏幕像素）
+            p.fillRect(QRectF(cx - half, 0, half * 2, self.height()),
+                       QColor("#0c0c0e"))              # 缝隙暗底
+            p.fillRect(QRectF(cx - 0.5, 0, 1.0, self.height()),
+                       QColor("#e8e8e8"))              # 1 屏幕像素亮芯
 
     def _clamp_pan(self):
-        b1, _ = self._base_rects()
-        self.pan = QPointF(max(0.0, min(self.pan.x(), b1.width() * (self.zoom - 1))),
-                           max(0.0, min(self.pan.y(), b1.height() * (self.zoom - 1))))
+        W, H = max(self.width(), 1), max(self.height(), 1)
+        self.pan = QPointF(max(0.0, min(self.pan.x(), W * (self.zoom - 1))),
+                           max(0.0, min(self.pan.y(), H * (self.zoom - 1))))
 
     def set_mode(self, mode: str):
         self.mode = mode
-        self._last_layout_key = None      # 失效 memo：强制 relayout 真正执行，重建 mask/几何
         self._clamp_pan()
-        self.relayout()                   # wipe 分支 setMask；side 分支自会 clearMask
+        self._apply_geometry()
 
     def set_split(self, ratio: float):
         self.split = max(0.0, min(ratio, 1.0))
-        self.relayout()
+        if self.mode == "wipe":
+            self._apply_masks()     # 只动 mask，几何不变——擦除悬停零延迟
+            self.update()           # 缝隙线跟随
+        self.splitMoved.emit(self.split)
 
     def set_zoom(self, z: float, anchor=None):
-        """anchor：容器坐标的缩放中心（默认页面中心）。"""
-        z = max(1.0, min(z, self.MAX_ZOOM))
+        """anchor：页面坐标的缩放中心（默认页面中心）。几何合并节流应用。"""
+        raw = max(1.0, min(z, self.MAX_ZOOM))
         if anchor is None:
             anchor = QPointF(self.width() / 2, self.height() / 2)
         old = self.zoom
-        if z == old:
+        if raw == old:
             return
-        self.pan = QPointF((anchor.x() + self.pan.x()) * z / old - anchor.x(),
-                           (anchor.y() + self.pan.y()) * z / old - anchor.y())
-        self.zoom = z
+        self.pan = QPointF((anchor.x() + self.pan.x()) * raw / old - anchor.x(),
+                           (anchor.y() + self.pan.y()) * raw / old - anchor.y())
+        self.zoom = raw
         if self.zoom == 1.0:
             self.pan = QPointF(0, 0)
         self._clamp_pan()
-        self.relayout()
-
-    def relayout(self):
-        # 布局去重：悬停/微小抖动下 setMask/setGeometry 全部跳过（零开销）
-        key = (self.mode, round(self.split * 1000), round(self.zoom * 100),
-               round(self.pan.x()), round(self.pan.y()), self.width(), self.height())
-        if key == self._last_layout_key:
-            return
-        self._last_layout_key = key
-        b1, b2 = self._base_rects()
-        z = self.zoom
-        px, py = self.pan.x(), self.pan.y()
-        self.w1.setGeometry(round(b1.x() - px), round(b1.y() - py),
-                            round(b1.width() * z), round(b1.height() * z))
-        self.w2.setGeometry(round(b2.x() - px), round(b2.y() - py),
-                            round(b2.width() * z), round(b2.height() * z))
-        if self.mode == "wipe":
-            split_px = round(self.width() * self.split)
-            # mask 坐标 = 容器分割线 − w2 原点，裁到 w2 范围内
-            mx = split_px - self.w2.x()
-            mw = max(0, min(mx, self.w2.width()))
-            if mw > 0:
-                self.w2.setMask(QRegion(0, 0, mw, self.w2.height()))
-            else:
-                self.w2.setMask(QRegion())
+        now = time.monotonic() * 1000
+        if now - self._last_apply_ms >= self.GEOM_COALESCE_MS:
+            self._apply_geometry()   # 距上次应用已超间隔：立即响应（孤立 tick 零延迟）
         else:
+            self._geom_timer.start() # 手势进行中：进 30ms 合并窗口
+
+    def refresh(self):
+        """外部（对话框装配/显示）强制立即重排。"""
+        self._apply_geometry()
+
+    def _apply_geometry(self):
+        """把 zoom/pan/mode 应用到两路几何并同步 mask（4K 重配置 ~13ms/次）。"""
+        self._geom_timer.stop()
+        self._last_apply_ms = time.monotonic() * 1000
+        W, H = max(self.width(), 1), max(self.height(), 1)
+        z, px, py = self.zoom, self.pan.x(), self.pan.y()
+        if self.mode == "wipe":
+            rect = QRect(round(-px), round(-py), round(W * z), round(H * z))
+            self.w1.setGeometry(rect)
+            self.w2.setGeometry(rect)
+        else:
+            gap = round(W * GAP_RATIO)
+            left_w = (W - gap) // 2
+            self.w2.setGeometry(QRect(round(-px), round(-py),
+                                      round(left_w * z), round(H * z)))
+            self.w1.setGeometry(QRect(round((left_w + gap) - px), round(-py),
+                                      round((W - left_w - gap) * z), round(H * z)))
+        self._apply_masks()
+        self.update()
+
+    def _apply_masks(self):
+        """擦除：左右各自裁到缝隙边缘（缝隙谁也不画 = 真实分割）；并排：无裁剪。
+
+        缝宽为屏幕常量（本页无变换，mask 坐标即屏幕逻辑像素），不随缩放变化。"""
+        if self.mode != "wipe":
+            self.w1.clearMask()
             self.w2.clearMask()
-        self.layoutChanged.emit()
+            return
+        half = self.SEAM_PX / 2.0                  # 缝隙半宽（屏幕像素）
+        split_page = self.width() * self.split
+        # widget 局部坐标 = 页面坐标 − widget 原点（wipe 下两路同几何）
+        ox, oy = self.w1.x(), self.w1.y()
+        cw, ch = self.w1.width(), self.w1.height()
+        x0 = (split_page - half) - ox              # w2（左）右界
+        x1 = (split_page + half) - ox              # w1（右）左界
+        if x0 > 0:
+            self.w2.setMask(QRegion(0, 0, round(min(x0, cw)), ch))
+        else:
+            self.w2.setMask(QRegion())
+        if x1 < cw:
+            self.w1.setMask(QRegion(round(max(x1, 0)), 0,
+                                    round(cw - max(x1, 0)), ch))
+        else:
+            self.w1.setMask(QRegion())
 
     def resizeEvent(self, ev):
         self._clamp_pan()
-        self.relayout()
+        self._apply_geometry()
 
     # —— 交互 ——
     def wheelEvent(self, ev):
@@ -209,10 +254,9 @@ class _VideoPage(QWidget):
             self.pan = QPointF(pan0.x() - (ev.position().x() - press.x()),
                                pan0.y() - (ev.position().y() - press.y()))
             self._clamp_pan()
-            self.relayout()
+            self._apply_geometry()    # 同尺寸移位（无 surface 重配置），即时跟手
         elif self.mode == "wipe":
             self.set_split(ev.position().x() / max(self.width(), 1))
-            self.splitMoved.emit(self.split)
         super().mouseMoveEvent(ev)
 
     def mouseReleaseEvent(self, ev):
@@ -304,19 +348,9 @@ class CompareDialog(QDialog):
         self.stack.addWidget(self.view)         # index 1: 图片场景
         root.addWidget(self.stack, 1)
 
-        # 原生视频模式的分割线 = 无父窗口的置顶 Tool 小窗（每对话框一次）。
-        # QVideoWidget 的视频呈现面会盖住同窗树内的一切兄弟/子窗口（z 序抢不过），
-        # 唯一可靠的是独立置顶顶层窗口（DWM 保证）；无父窗口 → setGeometry 即全局
-        # 逻辑坐标，配合 mapToGlobal 无换算歧义；应用失活/对话框隐藏自动隐藏。
-        self._line_overlay = QWidget(None, Qt.Tool | Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint)
-        self._line_overlay.setAttribute(Qt.WA_ShowWithoutActivating, True)
-        self._line_overlay.setAttribute(Qt.WA_TransparentForMouseEvents, True)
-        self._line_overlay.setFixedWidth(5)
-        self._line_overlay.setStyleSheet(
-            "background:#ffffff; border-left:1px solid #000000; border-right:1px solid #000000;")
-        self._line_overlay.hide()
-        QGuiApplication.instance().applicationStateChanged.connect(self._update_line_window)
-
+        # 分割线的两种形态都是画面真实分界、无浮层窗口：
+        # 视频模式 = _VideoPage 内双侧 mask 让出的缝隙（paintEvent 画线）；
+        # 图片模式 = 场景内 1px cosmetic 发丝线。
         self.hint = QLabel("")
         self.hint.setStyleSheet("color:#8a8f98;font-size:12px;")
         root.addWidget(self.hint)
@@ -377,6 +411,12 @@ class CompareDialog(QDialog):
     def _setup_compare(self):
         e1 = self._slot_entry(self.combo1.currentData())
         e2 = self._slot_entry(self.combo2.currentData())
+        # 原片帧时刻对齐另一侧渲染结果的源起点（渲染后动过时间轴，两侧内容也不再错位）
+        for orig, other in ((e1, e2), (e2, e1)):
+            if orig.get("lazy") and other.get("kind") in ("seg", "img"):
+                t = other.get("t0")
+                if t is not None:
+                    orig["t0"] = float(t)
         playable = ("seg", "source")
         # 视频对比：两侧都能播视频（source 恒可）且至少一侧是真渲染段
         self._video_mode = (e1["kind"] in playable and e2["kind"] in playable
@@ -389,8 +429,8 @@ class CompareDialog(QDialog):
         self.play_btn.setText("▶ 播放")
 
         self._line = QGraphicsLineItem()
-        pen = QPen(QColor(255, 255, 255, 210), 3)
-        pen.setCosmetic(True)               # 缩放时线宽恒定
+        pen = QPen(QColor(255, 255, 255, 230), 1)
+        pen.setCosmetic(True)               # 缩放时线宽恒定；1px 发丝线只作边界标记
         self._line.setPen(pen)
         self._line.setZValue(10)
 
@@ -412,7 +452,18 @@ class CompareDialog(QDialog):
             pm2 = self._resolve_pixmap(e2, prefer_t=e1.get("t0", 0.0))
         finally:
             QApplication.restoreOverrideCursor()
-        self._W, self._H = float(pm1.width()), float(pm1.height())
+        # 两侧分辨率不同（超分产物 > 原片）时统一到较大一侧（输出网格）：
+        # 若把输出缩到原片网格，恰好把超分增加的高频细节重采样掉——"放大对比
+        # 看不出变化"的直接原因。原片侧上采样到输出网格后，对比的就是
+        # "模型输出 vs 普通（bicubic）放大到同尺寸"，即有无 AI 的诚实对比。
+        W, H = max(pm1.width(), pm2.width()), max(pm1.height(), pm2.height())
+        if pm1.width() != W or pm1.height() != H:
+            pm1 = pm1.scaled(W, H, Qt.AspectRatioMode.IgnoreAspect,
+                             Qt.TransformationMode.SmoothTransformation)
+        if pm2.width() != W or pm2.height() != H:
+            pm2 = pm2.scaled(W, H, Qt.AspectRatioMode.IgnoreAspect,
+                             Qt.TransformationMode.SmoothTransformation)
+        self._W, self._H = float(W), float(H)
         self.item1 = _ClipPixmapItem(pm1)            # 底层 = 视频1
         self.item2 = _ClipPixmapItem(pm2)            # 顶层 = 视频2（裁剪）
         self.scene = QGraphicsScene(self)
@@ -457,8 +508,6 @@ class CompareDialog(QDialog):
         self._p2.mediaStatusChanged.connect(
             lambda st, p=self._p2, w=self._win2: self._on_media(st, p, w))
 
-        self.video_page.layoutChanged.connect(self._update_line_window)
-
         self.audio_btn.setEnabled(True)
         self.audio_btn.setChecked(False)
         self.audio_btn.setText("🔇")
@@ -470,8 +519,7 @@ class CompareDialog(QDialog):
         self._sync_timer.timeout.connect(self._align_playback)
         self._sync_timer.start()
         self.stack.setCurrentWidget(self.video_page)
-        self.video_page.relayout()
-        self._update_line_window()
+        self.video_page.refresh()
 
     def _video_window(self, e: dict, other: dict) -> dict:
         """播放窗口（映射到文件内毫秒）。
@@ -586,40 +634,7 @@ class CompareDialog(QDialog):
             if hasattr(self, "item1"):
                 self._sync_items_to_rects()
                 self.view.fit_content()
-        self._update_line_window()
         self._update_hint()
-
-    def _update_line_window(self):
-        """原生视频擦除模式的分割线 = 无父窗口的置顶 Tool 小窗（浮于一切视频之上）。
-        位置 = 遮罩边缘的 mapToGlobal（全局逻辑坐标）直接 setGeometry——
-        无父窗口 → 无任何相对坐标系歧义；应用失活/对话框隐藏时自动隐藏。
-        仅在"视频模式 + 擦除 + 视频页可见"时显示。"""
-        if getattr(self, "_line_overlay", None) is None:
-            return                          # 对话框已关闭（overlay 已销毁）
-        vp = self.video_page
-        lw = self._line_overlay
-        active = bool(QGuiApplication.applicationState() & Qt.ApplicationActive)
-        show = (self._video_mode
-                and self.mode == self.MODE_WIPE
-                and self.stack.currentWidget() is vp and vp.isVisible()
-                and self.isVisible() and active)
-        if not show:
-            lw.hide()
-            return
-        if self.mode == self.MODE_WIPE:
-            m = vp.w2.mask().boundingRect()
-            # 守卫条件用 round(W×split)>0：退化区间（页面左缘 <0.5 逻辑 px，重建
-            # 仍产生空 mask）不重建——否则与 relayout 的 layoutChanged 无限互递归
-            # → 原生栈溢出硬崩（Reviewer 复现）；该区间保持空 mask 合法、线贴边
-            if vp.width() > 0 and m.width() <= 0 and round(vp.width() * vp.split) > 0:
-                vp._last_layout_key = None
-                vp.relayout()             # 遮罩意外丢失时先重建再定位（加固）
-        edge_global = vp.w2.mapToGlobal(
-            QPoint(vp.w2.mask().boundingRect().right(), 0))
-        lw.setGeometry(edge_global.x() - 2, vp.mapToGlobal(QPoint(0, 0)).y(),
-                       5, vp.height())
-        lw.show()
-        lw.raise_()
 
     def _sync_items_to_rects(self):
         """图片场景：擦除=两路同位叠加（视频2裁左）；并排=视频2 左、视频1 右。"""
@@ -673,21 +688,10 @@ class CompareDialog(QDialog):
         super().showEvent(ev)
         # 构造期的 fitInView 算在未显示的 viewport 上，显示后重适配一次
         QTimer.singleShot(0, self._refit_if_unzoomed)
-        self._update_line_window()
-
-    def moveEvent(self, ev):
-        super().moveEvent(ev)
-        self._update_line_window()      # 顶层分割线小窗跟随对话框移动
-
-    def hideEvent(self, ev):
-        super().hideEvent(ev)
-        if getattr(self, "_line_overlay", None) is not None:
-            self._line_overlay.hide()
 
     def resizeEvent(self, ev):
         super().resizeEvent(ev)
         self._refit_if_unzoomed()
-        self._update_line_window()
 
     def _refit_if_unzoomed(self):
         view = getattr(self, "view", None)
@@ -706,11 +710,10 @@ class CompareDialog(QDialog):
             self.video_page.set_split(self._split)
 
     def _on_video_split(self, ratio: float):
-        # 单一事实来源：无论谁发起（页面鼠标 / 程序），mask、线窗、提示全部同步到同一值
+        # 单一事实来源：无论谁发起（页面鼠标 / 程序），缝隙、提示全部同步到同一值
         self._split = ratio
         if self.video_page.split != ratio:
-            self.video_page.set_split(ratio)   # 页面遮罩同步（relayout 有 memo，未变时零开销）
-        self._update_line_window()
+            self.video_page.set_split(ratio)   # 页面缝隙 mask 同步
         self._update_hint()
 
     def _toggle_fs(self):
@@ -735,7 +738,7 @@ class CompareDialog(QDialog):
             pos = f"分割 {self._split * 100:.0f}%" if self.mode == self.MODE_WIPE else ""
             self.hint.setText(
                 f"左＝{n2} · 右＝{n1}　|　原生全帧率播放 · 移动鼠标擦除 · "
-                f"暂停后扫动可静帧对比 · 双击/F11 全屏　|　{pos}")
+                f"滚轮缩放 · 左键拖动平移 · 双击/F11 全屏　|　{pos}")
         elif self.mode == self.MODE_WIPE:
             pos = f"分割 {self._split * 100:.0f}%"
             self.hint.setText(
@@ -747,15 +750,6 @@ class CompareDialog(QDialog):
 
     def done(self, r):
         self._stop_media()
-        if self._line_overlay is not None:
-            self._line_overlay.hide()
-            self._line_overlay.deleteLater()
-            self._line_overlay = None
-        try:
-            QGuiApplication.instance().applicationStateChanged.disconnect(
-                self._update_line_window)
-        except (RuntimeError, TypeError):
-            pass
         super().done(r)
 
 
