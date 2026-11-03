@@ -5,11 +5,13 @@
   完成后内嵌播放器自动循环播放，可存入 A/B/C/D 槽位对比
 - 帧渲染：单帧静态对比（快速看效果）
 - 插帧模块：帧渲染取相邻帧真实 midframe；片段渲染走完整插帧管线
-- 放大：QGraphicsView 滚轮缩放 + 拖动平移（仅静态帧）
+- 放大：Ctrl+滚轮 / 右上角按钮缩放 + 拖动平移（仅静态帧）
 """
 from __future__ import annotations
 
 import copy
+import itertools
+import os
 import subprocess
 import tempfile
 import time
@@ -24,7 +26,7 @@ from PySide6.QtMultimediaWidgets import QVideoWidget
 from PySide6.QtWidgets import (
     QCheckBox, QComboBox, QDialog, QGraphicsScene, QGraphicsView, QGridLayout,
     QHBoxLayout, QLabel, QProgressBar, QPushButton, QSlider, QStackedWidget,
-    QVBoxLayout, QWidget,
+    QToolButton, QVBoxLayout, QWidget,
 )
 
 from crispframe.ffutils import VideoInfo, SUBPROC_FLAGS, ffmpeg, probe
@@ -39,13 +41,18 @@ def frame_to_pixmap(bgr: np.ndarray) -> QPixmap:
     return QPixmap.fromImage(img)
 
 
+_tmp_seq = itertools.count()
+
+
 def grab_frame(src: Path, t: float, quality: int = 2,
                max_width: int = 0) -> np.ndarray | None:
     """抽一帧。max_width>0 时降采样到该宽度以内（只缩不放大）——
     时间轴浏览用，4K 源全分辨率抽帧 ~300ms/帧，降采样后快数倍；
     喂模型/像素级对比的场景不要传（保持全分辨率）。
-    max_width 进临时文件名，避免同秒并发抽帧（浏览 vs 渲染）写同名文件互踩。"""
-    tmp = Path(tempfile.gettempdir()) / f"cf_prev_{t:.3f}_{max_width}.jpg"
+    临时文件名带 pid+调用序号：同秒并发抽帧（浏览/渲染/原片槽重抽多线程）
+    各写各的，不互踩。"""
+    tmp = (Path(tempfile.gettempdir()) /
+           f"cf_prev_{t:.3f}_{max_width}_{os.getpid()}_{next(_tmp_seq)}.jpg")
     try:
         cmd = [ffmpeg(), "-nostdin", "-y", "-ss", f"{t:.3f}", "-i", str(src),
                "-frames:v", "1"]
@@ -73,6 +80,45 @@ class SeekThumb(QThread):
             self.got.emit(img)
 
 
+def _gpu_release(built) -> None:
+    """预览用完即卸：模型权重下卡、TRT 引擎析构、显存池归还 OS。
+
+    背景：torch 缓存池从不主动归还（模型/激活释放后留在池内），换模型预览时
+    nvidia-smi 显存单调增长；TRT runner 无主动销毁代码。预览是短任务，
+    用完即卸的代价（下次预览重新加载权重）远小于显存累积。清理失败不影响结果。"""
+    try:
+        import gc
+
+        import torch
+        if built is not None:
+            for stage in built.stages:
+                # StrengthBlend 等包装层的真实推理对象在 .inner 里
+                for obj in (stage, getattr(stage, "inner", None)):
+                    if obj is None:
+                        continue
+                    if getattr(obj, "runner", None) is not None:
+                        obj.runner = None     # TRT engine/context/stream 随析构归还
+                    model = getattr(obj, "model", None)
+                    nn = getattr(model, "model", None)   # spandrel descriptor → nn.Module
+                    if nn is not None:
+                        nn.cpu()              # 权重下卡
+            if built.interpolator is not None:
+                built.interpolator = None
+            try:
+                # RIFE 的全局光流网格缓存：每 (device, shape) 一张 CUDA 张量
+                # （720p 约 7.5MB，4K UHD 约 67MB）常驻进程；clear 后 warp()
+                # 按 miss 重建，并发 Worker 也只是重建一次的开销
+                from crispframe._rife import _rife_warplayer
+                _rife_warplayer.backwarp_tenGrid.clear()
+            except Exception:
+                pass
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()          # 缓存池归还 OS（nvidia-smi 立即回落）
+    except Exception:  # noqa: BLE001  清理是尽力而为，绝不掩盖渲染结果
+        pass
+
+
 class RenderModule(QThread):
     """后台渲染单帧：当前帧只过目标模块。插帧模块取相邻两帧做真实 midframe。"""
     got = Signal(object, str)  # np.ndarray | None, message
@@ -84,6 +130,7 @@ class RenderModule(QThread):
         self.info = info
 
     def run(self):
+        built = None
         try:
             info = self.info or probe(self.src)
             ctx = BuildContext(width=info.width, height=info.height, fps=info.fps)
@@ -110,6 +157,8 @@ class RenderModule(QThread):
             self.got.emit(out, self.label)
         except Exception as e:  # noqa: BLE001
             self.got.emit(None, f"{self.label}（失败: {e}）")
+        finally:
+            _gpu_release(built)   # 用完即卸：换模型预览不累积显存
 
 
 class RenderSegment(QThread):
@@ -132,6 +181,7 @@ class RenderSegment(QThread):
 
     def run(self):
         out = Path(tempfile.gettempdir()) / f"cf_seg_{int(time.time() * 1000)}.mp4"
+        built = None
         try:
             info = self.info or probe(self.src)
             ctx = BuildContext(width=info.width, height=info.height, fps=info.fps)
@@ -158,33 +208,160 @@ class RenderSegment(QThread):
         except Exception as e:  # noqa: BLE001
             out.unlink(missing_ok=True)
             self.got.emit(None, f"{self.label}（失败: {e}）")
+        finally:
+            _gpu_release(built)   # 用完即卸：换模型预览不累积显存
 
 
 class ZoomView(QGraphicsView):
-    """滚轮缩放 + 拖拽平移的图像查看器。"""
+    """Ctrl+滚轮缩放（光标锚点）+ 拖拽平移 + 双击切换 1:1 像素的图像查看器。
+
+    超分差异必须 1:1 像素对齐才可见（fit 视图会把 4K 帧缩到 1/3，
+    源帧与输出帧显示像素完全一样）。左上角常驻倍率标签（100% = 1:1），
+    右上角常驻缩放按钮组（−/＋/1:1/适应）——缩放能力有可见入口，不靠盲猜手势。"""
 
     def __init__(self):
         super().__init__()
         self.setDragMode(QGraphicsView.ScrollHandDrag)
-        self._zoom = 1.0
+        self._zoom = 1.0          # 相对 fit 的倍率（1.0 = fit 适配窗口）
+        self._mode = "fit"        # fit = 适配窗口（resize 跟随）；zoom = 用户显式缩放（保持）
+        self._pm_size: tuple[int, int] | None = None
+        self._ratio_lab = QLabel(self)
+        self._ratio_lab.setStyleSheet(
+            "background:rgba(20,20,24,185);color:#ddd;padding:2px 8px;"
+            "border-radius:4px;font-size:12px;")
+        self._ratio_lab.hide()
+        # 右上角悬浮缩放控制条
+        bar = QWidget(self)
+        lay = QHBoxLayout(bar)
+        lay.setContentsMargins(3, 2, 3, 2)
+        lay.setSpacing(2)
+        for text, tip, fn in (
+                ("−", "缩小（Ctrl+滚轮）", lambda: self._zoom_by(0.8)),
+                ("＋", "放大（Ctrl+滚轮）", lambda: self._zoom_by(1.25)),
+                ("1:1", "实际像素（双击画面切换）", self._toggle_1to1),
+                ("适应", "适应窗口", self._fit_window)):
+            b = QToolButton(bar)
+            b.setText(text)
+            b.setToolTip(tip)
+            b.setAutoRaise(True)
+            b.setCursor(Qt.PointingHandCursor)
+            b.clicked.connect(fn)
+            lay.addWidget(b)
+        bar.setStyleSheet("background:rgba(20,20,24,185);border-radius:4px;")
+        self._ctl = bar
+        self._place_ctl()
 
-    def set_image(self, pixmap: QPixmap):
-        self._zoom = 1.0
-        self.resetTransform()
+    def _place_ctl(self):
+        self._ctl.adjustSize()
+        self._ctl.move(max(10, self.width() - self._ctl.width() - 10), 10)
+        self._ctl.raise_()
+
+    def set_image(self, pixmap: QPixmap, keep_zoom: bool = False):
+        if not keep_zoom:
+            self._zoom = 1.0
+            self._mode = "fit"
+        else:
+            # 从当前 transform 反推倍率：双击 1:1 时 _zoom 含滚动条出现前的
+            # fit_scale 推算误差，直接用实际 m11 重derive 保证精确保持
+            self._zoom = (self.transform().m11()
+                          / max(self._fit_scale(), 1e-6))
+            self._mode = "zoom" if self._zoom > 1.0 else "fit"
         sc = QGraphicsScene(self)
         sc.addPixmap(pixmap)
         self.setScene(sc)
-        self.fitInView(self.sceneRect(), Qt.KeepAspectRatio)
+        self._pm_size = pixmap.width(), pixmap.height()
+        self._apply()
+        self._update_ratio()
 
-    def wheelEvent(self, ev):
-        factor = 1.25 if ev.angleDelta().y() > 0 else 0.8
-        self._zoom *= factor
-        if self._zoom < 1.0:
-            self._zoom = 1.0
+    def _fit_scale(self) -> float:
+        """fit 状态下 1 图像像素对应的 view 逻辑像素数。"""
+        if not self._pm_size:
+            return 1.0
+        vr = self.viewport().rect()
+        pw, ph = self._pm_size
+        return min(vr.width() / pw, vr.height() / ph) if pw and ph else 1.0
+
+    def _apply(self):
+        """按 _mode 应用视图：fit 适配窗口；zoom 按绝对倍率（fit 缩放 × _zoom）。"""
+        if self._mode == "fit" or not self._pm_size:
             self.resetTransform()
             self.fitInView(self.sceneRect(), Qt.KeepAspectRatio)
+            self._update_ratio()
             return
-        self.scale(factor, factor)
+        center = self.mapToScene(self.viewport().rect().center())
+        self.resetTransform()
+        self.scale(self._fit_scale() * self._zoom,
+                   self._fit_scale() * self._zoom)
+        self.centerOn(center)
+        self._update_ratio()
+
+    def _update_ratio(self):
+        if not self._pm_size:
+            self._ratio_lab.hide()
+            return
+        # 1:1 = m11(1/dpr)：换算成相对物理像素的百分比，高分屏缩放下也显示正确
+        pct = self.transform().m11() * max(self.devicePixelRatioF(), 1e-6) * 100
+        self._ratio_lab.setText(f"{pct:.0f}%")
+        self._ratio_lab.adjustSize()
+        self._ratio_lab.move(10, 10)
+        self._ratio_lab.raise_()
+        self._ratio_lab.show()
+
+    def _zoom_by(self, factor: float, anchor=None):
+        """以 anchor（viewport 坐标，None=中心）为锚点缩放；下限 fit。"""
+        if not self._pm_size:
+            return
+        anchor = anchor or self.viewport().rect().center()
+        sp = self.mapToScene(anchor)
+        self._zoom = max(1.0, self._zoom * factor)
+        self._mode = "fit" if self._zoom <= 1.0 else "zoom"
+        self._apply()
+        if self._mode == "zoom":
+            # 把锚点下的场景点放回锚点处（光标缩放）
+            delta = self.mapFromScene(sp) - anchor
+            self.horizontalScrollBar().setValue(
+                self.horizontalScrollBar().value() + delta.x())
+            self.verticalScrollBar().setValue(
+                self.verticalScrollBar().value() + delta.y())
+
+    def _toggle_1to1(self):
+        """fit/zoom ↔ 1:1（1 图像像素 = 1 屏幕物理像素；绝对 transform，
+        不经 fit 推算避免舍入）。zoom 模式下 resize/滚动条变化不再重算，
+        保证 1:1 稳定成立。双击画面与「1:1」按钮共用。"""
+        dpr = max(self.devicePixelRatioF(), 1e-6)
+        if abs(self.transform().m11() - 1 / dpr) < 0.02:
+            self._fit_window()
+            return
+        self._mode = "zoom"
+        center = self.mapToScene(self.viewport().rect().center())
+        self._zoom = (1 / dpr) / max(self._fit_scale(), 1e-6)
+        self.resetTransform()
+        self.scale(1 / dpr, 1 / dpr)
+        self.centerOn(center)
+        self._update_ratio()
+
+    def _fit_window(self):
+        self._zoom = 1.0
+        self._mode = "fit"
+        self._apply()
+
+    def wheelEvent(self, ev):
+        if ev.modifiers() & Qt.ControlModifier:
+            self._zoom_by(1.25 if ev.angleDelta().y() > 0 else 0.8,
+                          ev.position().toPoint())
+        else:
+            super().wheelEvent(ev)   # 非 Ctrl：放大态滚滚动条平移，fit 态无操作
+
+    def mouseDoubleClickEvent(self, ev):
+        self._toggle_1to1()
+
+    def resizeEvent(self, ev):
+        super().resizeEvent(ev)
+        if self._pm_size and self._mode == "fit":
+            self.resetTransform()
+            self.fitInView(self.sceneRect(), Qt.KeepAspectRatio)
+        self._update_ratio()
+        self._place_ctl()
 
 
 class ParamPanel(QWidget):
@@ -437,6 +614,9 @@ class PreviewDialog(QDialog):
         self.stack.setCurrentWidget(self.view)
         self.view.set_image(pm)
         self._store_slot(slot, "img", pm, label, t0=self._current_t())
+        # 放大差异要 1:1 像素才可见（fit 视图会被缩小抹掉）——渲染完成即引导
+        self.setWindowTitle(f"模块预览 — {label} · Ctrl+滚轮 缩放，"
+                            f"双击画面 1:1 看细节，或点 🔍 对比 与原片擦除对比")
 
     # —— 渲染：片段 ——
     def _render_segment(self):
@@ -503,10 +683,15 @@ class PreviewDialog(QDialog):
             any(k in self.slots for k in self.RENDER_SLOTS))
 
     def _show_slot(self, s: str):
-        if s == self.ORIG_KEY:   # 原片位：回到当前时间点的源画面
+        if s == self.ORIG_KEY:   # 原片位：全分辨率重抽（1:1 对比需要，与输出同倍率查看）
             self.player.stop()
             self.stack.setCurrentWidget(self.view)
-            self._show_original_at(self._current_t())
+            t = self._current_t()
+            img = grab_frame(self.src, t)
+            if img is not None:
+                self.view.set_image(frame_to_pixmap(img), keep_zoom=True)
+            else:
+                self._show_original_at(t)   # 抽帧失败回退时间轴浏览图
             return
         entry = self.slots.get(s)
         if not entry:
@@ -516,7 +701,7 @@ class PreviewDialog(QDialog):
         else:
             self.player.stop()
             self.stack.setCurrentWidget(self.view)
-            self.view.set_image(entry["payload"])
+            self.view.set_image(entry["payload"], keep_zoom=True)   # 同倍率切换对比
 
     def _open_compare(self):
         if not any(k in self.slots for k in self.RENDER_SLOTS):
