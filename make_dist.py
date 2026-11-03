@@ -78,7 +78,8 @@ def _ensure_python_embed() -> None:
         zf.extractall(RUNTIME)
     # ._pth 默认隔离 import site；改为常规布局（启用 site + app 目录入 path）
     pth = next(RUNTIME.glob("python*._pth"))
-    pth.write_text("python313.zip\n.\nLib\\site-packages\napp\nimport site\n", encoding="ascii")
+    stdlib_zip = f"python{sys.version_info.major}{sys.version_info.minor}.zip"
+    pth.write_text(f"{stdlib_zip}\n.\nLib\\site-packages\napp\nimport site\n", encoding="ascii")
 
 
 def _copy_app() -> None:
