@@ -1,13 +1,12 @@
-"""存档压缩页：SVT-AV1 单进程直编 + 编码后三项验证的独立简洁界面。
+"""存档压缩页：SVT-AV1 分段直编（断点续跑/暂停）+ 编码后三项验证。
 
-与任务页（AI 增强）完全分离——没有模块链、没有输出设置抽屉：
-画质只有 CRF 一个旋钮，编码固定 SVT-AV1 preset4（定版存档基线），容器可选
-（VIDEO_CONTAINERS 全清单），位深自动跟随源片，输出到源文件所在目录。
+与旧增强界面完全分离：画质只有 CRF 一个旋钮，编码固定 SVT-AV1 preset4
+（定版存档基线），容器可选（VIDEO_CONTAINERS 全清单），位深自动跟随源片，
+输出到源文件所在目录。分段编排（断点续跑/暂停/合并）在 crispframe.archive_job；
+逐核相关性调度在 crispframe.affinity（任务管理器式对话框，编码中即时生效）。
 
-引擎复用 crispframe.pipeline.run_passthrough（单进程直编，SVT 全核线程、
-色彩/时基元数据 passthrough）与 crispframe.verify（体积/元数据/全量解码
-查错），本文件只负责界面与编排。容器清单按 AV1 实测兼容集过滤
-（available_containers("svtav1")）。
+引擎复用 crispframe.pipeline.run_passthrough（单进程直编，色彩/时基元数据
+passthrough）与 crispframe.verify（体积/元数据/全量解码查错）。
 """
 from __future__ import annotations
 
@@ -16,24 +15,24 @@ import time
 from pathlib import Path
 
 from PySide6.QtCore import Qt, QThread, Signal
-from PySide6.QtWidgets import (QFileDialog, QHBoxLayout, QLabel, QListWidget, QComboBox,
-                               QPushButton, QProgressBar, QSlider, QTextEdit,
-                               QVBoxLayout, QWidget)
+from PySide6.QtWidgets import (QCheckBox, QComboBox, QDialog, QFileDialog,
+                               QGridLayout, QGroupBox, QHBoxLayout, QLabel,
+                               QListWidget, QPushButton, QProgressBar, QSlider,
+                               QTextEdit, QVBoxLayout, QWidget)
 
+from crispframe import affinity
+from crispframe.archive_job import parts_dir, run_segmented
 from crispframe.codec import (VIDEO_CONTAINERS, available_containers,
-                              archive_pix_fmt, CodecSettings,
-                              build_encode_config_kwargs,
-                              is_svt_8k_error, svtav1_fix_preset)
+                              archive_pix_fmt, CodecSettings)
 from crispframe.ffutils import VideoInfo, probe
-from crispframe.pipeline import (EncodeConfig, PassthroughCanceled,
-                                 SilentTermination, run_passthrough)
+from crispframe.pipeline import PassthroughCanceled
 from crispframe.verify import human_size, probe_stream_meta, verify_output
 
 _CRF_NOTES = {25: "稳", 27: "稳", 30: "甜点", 32: "省"}
 
 
 class ProbeWorker(QThread):
-    """轻量探测：只取 VideoInfo（不建 Task，与增强任务页无关）。"""
+    """轻量探测：只取 VideoInfo。"""
     probed = Signal(str, object, str)   # path, VideoInfo | None, err
 
     def __init__(self, paths: list[Path]):
@@ -54,21 +53,44 @@ class ArchiveWorker(QThread):
     fileDone = Signal(str, bool, str)      # 文件名, 成功, 消息
     allDone = Signal(bool, str)
 
-    def __init__(self, items: list[tuple[Path, VideoInfo]], crf: int, container: str = "matroska"):
+    def __init__(self, items: list[tuple[Path, VideoInfo]], crf: int,
+                 container: str = "matroska", affinity_ids: list[int] | None = None):
         super().__init__()
         self.items = items
         self.crf = crf
         self.container = container
-        self._cancel = False
+        self.affinity_ids = affinity_ids   # None=不干预；list=逐核勾选集合
+        self._cancel = False               # 放弃：终止当前段并删分片
+        self._pause = False                # 暂停：当前段跑完（或被立即终止）后保留分片
+        self._proc = None                  # 当前段 ffmpeg 进程（相关性切换用）
 
     def cancel(self):
         self._cancel = True
+
+    def pause(self):
+        self._pause = True
+        # 立即终止当前段 ffmpeg：run_passthrough 收到 rc≠0+零 stderr →
+        # SilentTermination → archive_job 的 pause 分支（残段丢、完成段留）
+        if self._proc is not None:
+            try:
+                self._proc.terminate()
+            except OSError:
+                pass
+
+    def set_affinity(self, ids: list[int]) -> None:
+        """编码中即时切换相关性（GUI 线程调用；Win32 调用线程安全）。"""
+        self.affinity_ids = ids
+        if self._proc is not None and ids:
+            if affinity.apply(self._proc, ids):
+                self.log.emit(f"  相关性已切换：CPU {', '.join(map(str, sorted(ids)))}")
+            else:
+                self.log.emit("  ⚠ 相关性切换失败（本机不支持）")
 
     def run(self):
         ok_all = True
         for src, info in self.items:
             if self._cancel:
-                self.fileDone.emit(src.name, False, "已取消")
+                self.fileDone.emit(src.name, False, "已放弃")
                 ok_all = False
                 continue
             try:
@@ -79,52 +101,20 @@ class ArchiveWorker(QThread):
                 self.fileDone.emit(src.name, False, str(e))
                 ok_all = False
         if self._cancel:
-            self.allDone.emit(False, "已取消")
+            self.allDone.emit(False, "已放弃")
         else:
             self.allDone.emit(ok_all, "全部完成" if ok_all else "有文件未完成存档")
 
-    def _encode_selfheal(self, src: Path, info: VideoInfo, out: Path,
-                         cs: CodecSettings) -> str:
-        """单进程直编（全流），含两类自愈重试（共用一次重试额度）。
-
-        返回 'ok' / 'cancel' / 错误消息。失败即删残件：
-        - SVT 拒绝 8K 级分辨率的 preset<5 → 按报错标志自动上调 preset5；
-        - 进程被外部无声终止（零错误输出，环境性瞬时故障）→ 原参数重试一次。"""
-        for attempt in range(2):
-            encode = EncodeConfig(**build_encode_config_kwargs(cs, map_all=True))
-            try:
-                run_passthrough(info, out, encode=encode,
-                                progress_callback=lambda dn, t: self.taskProgress.emit(
-                                    src.name, int(dn), int(t)),
-                                cancel_check=lambda: self._cancel)
-                return "ok"
-            except PassthroughCanceled:
-                out.unlink(missing_ok=True)
-                self.log.emit(f"  {src.name}: 已取消，残缺产物已删除")
-                return "cancel"
-            except Exception as e:  # noqa: BLE001
-                out.unlink(missing_ok=True)
-                if attempt == 0 and cs.preset < 5 and is_svt_8k_error(str(e)):
-                    self.log.emit(f"⚠ {src.name}: SVT 拒绝该分辨率的 "
-                                  f"preset{cs.preset}（8K 级限制），自动改用 preset5 重试")
-                    cs.preset = 5
-                    continue
-                if attempt == 0 and isinstance(e, SilentTermination):
-                    self.log.emit(f"⚠ {src.name}: 编码进程被外部终止"
-                                  f"（无错误输出），自动重试一次")
-                    continue
-                self.log.emit(f"[错误] {src.name}: {e}")
-                return f"编码失败: {str(e)[:120]}"
-        return "编码失败"
+    def _on_proc(self, proc):
+        self._proc = proc
+        if self.affinity_ids:
+            affinity.apply(proc, self.affinity_ids)
 
     def _process_one(self, src: Path, info: VideoInfo) -> bool:
-        """单文件：预检 → 单进程直编（全流）→ 三项验证。失败/取消删产物。"""
+        """单文件：预检 → 分段直编（断点续跑）→ 三项验证。失败/放弃清分片。"""
         cs = CodecSettings()              # 定版基线：svtav1 / preset4 / matroska / 10bit
         cs.crf = self.crf
         cs.container = self.container
-        # 8K 级分辨率（面积阈值见 codec.SVT_8K_AREA）SVT 拒绝 preset4，主动上调
-        cs.preset, preset_bumped = svtav1_fix_preset(cs.preset,
-                                                     info.width, info.height)
         ext = VIDEO_CONTAINERS[self.container]["ext"]
         out = src.with_name(f"{src.stem}.cf.archive-crf{self.crf}{ext}")
         if out.exists():
@@ -150,34 +140,51 @@ class ArchiveWorker(QThread):
 
         cont_label = VIDEO_CONTAINERS[self.container]["label"]
         self.log.emit(f"▶ {src.name}: {info.width}x{info.height}@{info.fps:.3f} "
-                      f"SVT-AV1 crf{cs.crf}/preset{cs.preset}"
-                      f"{'（8K 级自动上调）' if preset_bumped else ''} → "
-                      f"{cont_label.split('（')[0]}"
-                      f"（单进程直编，全流保留，色彩/时基跟随源），完成后自动验证")
+                      f"SVT-AV1 crf{cs.crf}/preset{cs.preset} → {cont_label.split('（')[0]}"
+                      f"（分段直编，每段 {run_seg_secs()}s，全流保留，色彩/时基跟随源），"
+                      f"完成后自动验证")
         t0 = time.perf_counter()
-        result = self._encode_selfheal(src, info, out, cs)
+        try:
+            result = run_segmented(
+                info, src, out, cs,
+                cancel_check=lambda: self._cancel,
+                pause_check=lambda: self._pause,
+                progress_cb=lambda d, t: self.taskProgress.emit(src.name, int(d), int(t)),
+                log_cb=self.log.emit,
+                on_process=self._on_proc)
+        except PassthroughCanceled:
+            self.log.emit(f"  {src.name}: 已放弃，分片与残件已删除")
+            self.fileDone.emit(src.name, False, "已放弃")
+            return False
+        self._proc = None
+        if result == "pause":
+            self.log.emit(f"  {src.name}: 已暂停——分片保留，可随时关闭软件；"
+                          f"重新加入该源片点「继续存档」即可续跑")
+            self.fileDone.emit(src.name, False, "已暂停（可续跑）")
+            return False
         if result != "ok":
-            if result != "cancel":
-                self.log.emit("  编码失败的残缺产物已删除（源片保留）")
-            self.fileDone.emit(src.name, False,
-                               "已取消" if result == "cancel" else result)
+            self.log.emit("  存档失败：分片与残件已删除（源片保留）")
+            self.fileDone.emit(src.name, False, "存档失败")
             return False
         self.log.emit(f"✓ {out.name}  编码 {time.perf_counter() - t0:.0f}s / "
                       f"{human_size(out.stat().st_size)}")
 
         verdict = self._verify(src, out)
+        pd = parts_dir(src, cs)
         if verdict == "pass":
+            shutil.rmtree(pd, ignore_errors=True)   # 验证通过才清分片
             self.fileDone.emit(src.name, True, out.name)
             return True
         out.unlink(missing_ok=True)       # 未过验证 = 不可归档，删除待重跑
-        self.log.emit("  未通过验证的产物已删除（源片保留），可重新开始存档")
+        shutil.rmtree(pd, ignore_errors=True)
+        self.log.emit("  未通过验证的成品已删除（源片保留），可重新开始存档")
         self.fileDone.emit(src.name, False,
-                           "已取消" if verdict == "cancel" else "验证未通过")
+                           "已放弃" if verdict == "cancel" else "验证未通过")
         return False
 
     def _verify(self, src: Path, out: Path) -> str:
         """返回 'pass' / 'fail' / 'cancel'。"""
-        self.log.emit("  验证：体积 / 元数据 / 全量解码查错（约数分钟到半小时，可停止）...")
+        self.log.emit("  验证：体积 / 元数据 / 全量解码查错（约数分钟到半小时，可放弃）...")
         vr = verify_output(
             out, src, strict_metadata=True,
             progress_callback=lambda dn, t: self.taskProgress.emit(src.name, dn, t),
@@ -193,11 +200,102 @@ class ArchiveWorker(QThread):
         return "fail"
 
 
+def run_seg_secs() -> int:
+    from crispframe.archive_job import SEG_SECS
+    return SEG_SECS
+
+
 VIDEO_EXTS = {".mp4", ".mkv", ".avi", ".webm", ".mov", ".ts", ".m2ts", ".flv"}
 
 
+class AffinityDialog(QDialog):
+    """任务管理器式逐核相关性设置：每个逻辑处理器独立勾选。"""
+
+    def __init__(self, parent, current_ids: list[int] | None):
+        super().__init__(parent)
+        self.setWindowTitle("设置 CPU 相关性（编码中即时生效）")
+        self.selected_ids: list[int] | None = None
+        try:
+            p_cores, e_cores = affinity.topology()
+        except Exception as e:  # noqa: BLE001
+            from PySide6.QtWidgets import QMessageBox
+            QMessageBox.critical(self, "设置相关性", f"本机拓扑读取失败：{e}")
+            self._all: list[int] = []
+            return
+        p_set, e_set = set(p_cores), set(e_cores)
+        self._all = sorted(p_set | e_set)
+        self._boxes: dict[int, QCheckBox] = {}
+        v = QVBoxLayout(self)
+
+        tip = QLabel("勾选允许参与编码的逻辑处理器；编码进行中确认后立即生效。"
+                     "全选 = 不干预（系统默认调度）。")
+        tip.setWordWrap(True)
+        v.addWidget(tip)
+
+        rows = QHBoxLayout()
+        for group_name, ids in (("大核（P）", sorted(p_set)),
+                                ("小核（E）", sorted(e_set))):
+            gb = QGroupBox(group_name)
+            gv = QGridLayout(gb)
+            for r, i in enumerate(ids):
+                cb = QCheckBox(f"CPU {i}")
+                cb.setChecked(current_ids is None or i in current_ids)
+                cb.stateChanged.connect(self._sync_ok)
+                self._boxes[i] = cb
+                gv.addWidget(cb, r // 2, r % 2)
+            rows.addWidget(gb)
+        v.addLayout(rows)
+
+        pb = QHBoxLayout()
+        for text, ids in (("全选", self._all),
+                          ("全大核", p_cores),
+                          ("全小核", e_cores),
+                          ("反选", None)):
+            b = QPushButton(text)
+            b.clicked.connect(lambda _, ids=ids: self._preset(ids))
+            pb.addWidget(b)
+        pb.addStretch()
+        v.addLayout(pb)
+
+        bb = QHBoxLayout()
+        bb.addStretch()
+        ok = QPushButton("确定")
+        ok.setObjectName("startBtn")
+        ok.clicked.connect(self.accept)
+        bb.addWidget(ok)
+        cancel = QPushButton("取消")
+        cancel.clicked.connect(self.reject)
+        bb.addWidget(cancel)
+        v.addLayout(bb)
+        self._sync_ok()
+
+    def _preset(self, ids: list[int] | None):
+        if ids is None:                       # 反选
+            for i, cb in self._boxes.items():
+                cb.setChecked(i not in self.selected_now())
+            return
+        for i, cb in self._boxes.items():
+            cb.setChecked(i in ids)
+        self._sync_ok()
+
+    def selected_now(self) -> list[int]:
+        return [i for i, cb in self._boxes.items() if cb.isChecked()]
+
+    def _sync_ok(self):
+        for b in self.findChildren(QPushButton):
+            if b.objectName() == "startBtn":
+                b.setEnabled(bool(self.selected_now()))
+
+    def accept(self):
+        sel = self.selected_now()
+        if not sel:
+            return
+        self.selected_ids = sel
+        super().accept()
+
+
 class ArchivePage(QWidget):
-    """存档压缩独立界面：拖入视频 + 一个 CRF 旋钮 + 开始/停止 + 进度与验证日志。"""
+    """存档压缩页：拖入视频 + CRF 旋钮 + 暂停/放弃 + 逐核相关性 + 进度与验证日志。"""
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -206,6 +304,7 @@ class ArchivePage(QWidget):
         self._probe_workers: list[ProbeWorker] = []
         self._gen = 0                  # 清空即换代：在途探测的回填按代丢弃
         self.worker: ArchiveWorker | None = None
+        self._affinity_ids: list[int] | None = None   # None=不干预
         self.setAcceptDrops(True)
 
         v = QVBoxLayout(self)
@@ -213,8 +312,9 @@ class ArchivePage(QWidget):
         title = QLabel("存档压缩")
         title.setStyleSheet("font-size:22px;font-weight:bold;")
         v.addWidget(title)
-        sub = QLabel("SVT-AV1 恒定画质单进程直编（CPU 全核） · 保留全部音轨/字幕/章节 · "
-                     "位深/色彩/时基跟随源片 · 容器可选 · 编码后自动验证完整性")
+        sub = QLabel("SVT-AV1 恒定画质分段直编 · 暂停后可关闭软件、重新打开自动续跑 · "
+                     "保留全部音轨/字幕/章节 · 位深/色彩/时基跟随源片 · 容器可选 · "
+                     "编码后自动验证完整性")
         sub.setStyleSheet("color:#9aa0a8;")
         sub.setWordWrap(True)
         v.addWidget(sub)
@@ -232,8 +332,6 @@ class ArchivePage(QWidget):
         crow = QHBoxLayout()
         crow.addWidget(QLabel("输出容器"))
         self.container_box = QComboBox()
-        # 存档固定 SVT-AV1：容器下拉按 AV1 的实测兼容集过滤（muxer 层会硬拒
-        # 其余组合），动态检测本机 ffmpeg 支持
         self._containers = available_containers("svtav1")
         for key, spec in self._containers.items():
             self.container_box.addItem(f"{spec['label']} — {spec['note']}", key)
@@ -242,6 +340,11 @@ class ArchivePage(QWidget):
             lambda _: (self.tip.setText(self._tip_text()),
                        self._sync_crf(self.crf_slider.value())))
         crow.addWidget(self.container_box, 1)
+        self.aff_btn = QPushButton("设置相关性…")
+        self.aff_btn.setToolTip("逐逻辑处理器勾选（大核/小核分组），编码中确认即时生效；"
+                                "默认不干预")
+        self.aff_btn.clicked.connect(self._open_affinity)
+        crow.addWidget(self.aff_btn)
         v.addLayout(crow)
 
         row = QHBoxLayout()
@@ -272,10 +375,21 @@ class ArchivePage(QWidget):
         bar.addWidget(rm)
         self._list_btns = (clear, rm)
         bar.addStretch()
-        self.stop_btn = QPushButton("停止")
-        self.stop_btn.setEnabled(False)
-        self.stop_btn.clicked.connect(self._stop)
-        bar.addWidget(self.stop_btn)
+        self.aff_live_btn = QPushButton("相关性…")
+        self.aff_live_btn.setVisible(False)
+        self.aff_live_btn.clicked.connect(self._open_affinity)
+        bar.addWidget(self.aff_live_btn)
+        self.abandon_btn = QPushButton("放弃")
+        self.abandon_btn.setVisible(False)
+        self.abandon_btn.setToolTip("终止并存档：删除分片与残件，从头再来")
+        self.abandon_btn.clicked.connect(self._abandon)
+        bar.addWidget(self.abandon_btn)
+        self.pause_btn = QPushButton("暂停")
+        self.pause_btn.setVisible(False)
+        self.pause_btn.setToolTip("立即暂停：当前段作废、已完成段保留，"
+                                  "可随时关闭软件；重新加入源片即可续跑")
+        self.pause_btn.clicked.connect(self._pause)
+        bar.addWidget(self.pause_btn)
         self.start_btn = QPushButton("开始存档")
         self.start_btn.setObjectName("startBtn")
         self.start_btn.setEnabled(False)
@@ -295,9 +409,6 @@ class ArchivePage(QWidget):
         files, _ = QFileDialog.getOpenFileNames(
             self, "选择视频", "", "视频 (*.mp4 *.mkv *.avi *.webm *.mov *.ts *.m2ts *.flv)")
         self.set_files([Path(f) for f in files])
-
-    def setAcceptDrops(self, *a, **k):      # 覆盖 QWidget 默认行为前先放行
-        super().setAcceptDrops(*a, **k)
 
     def dragEnterEvent(self, e):
         if e.mimeData().hasUrls():
@@ -324,8 +435,8 @@ class ArchivePage(QWidget):
             w = ProbeWorker([p])
             self._probe_workers.append(w)
             w.probed.connect(lambda ps, info, err, g=gen: self._on_probed(ps, info, err, g))
-            w.finished.connect(lambda ww=w: self._probe_workers.remove(ww)
-                               if ww in self._probe_workers else None)
+            w.finished.connect(
+                lambda w=w: self._probe_workers.remove(w) if w in self._probe_workers else None)
             w.start()
 
     def _on_probed(self, path_str: str, info, err: str, gen: int = -1):
@@ -338,6 +449,14 @@ class ArchivePage(QWidget):
             self.log_box.append(f"[跳过] {err}")
             return
         self._items.append((p, info))
+        self._sync_start_text()
+        # 断点探测：同 CRF/容器设置的分片目录存在 → 提示续跑
+        cs = CodecSettings()
+        cs.crf = self.crf_slider.value()
+        cs.container = self._container_key()
+        if parts_dir(p, cs).exists():
+            self.log_box.append(f"[续跑] {p.name}: 发现未完成的存档分片，"
+                                f"点「继续存档」将从断点继续（CRF/容器需与上次一致）")
         self._sync_buttons()
 
     def _take_item(self, p: Path):
@@ -366,8 +485,12 @@ class ArchivePage(QWidget):
         busy = self.worker is not None
         self.start_btn.setEnabled(bool(self._items) and not busy)
         for b in self._list_btns:
-            b.setEnabled(bool(self._items) and not busy)   # 列表即任务清单
-        self.stop_btn.setEnabled(busy)
+            b.setEnabled(bool(self._items) and not busy)
+        self.pause_btn.setVisible(busy)
+        self.pause_btn.setEnabled(busy)
+        self.aff_live_btn.setVisible(busy)
+        self.abandon_btn.setVisible(busy)
+        self.abandon_btn.setEnabled(busy)
 
     # —— 设置 ——
     def _notes_text(self) -> str:
@@ -386,12 +509,23 @@ class ArchivePage(QWidget):
     def _sync_crf(self, v: int):
         self.crf_lab.setText(f"CRF {v}")
 
+    # —— 相关性 ——
+    def _open_affinity(self):
+        dlg = AffinityDialog(self, self._affinity_ids)
+        if dlg.exec() and dlg.selected_ids:
+            self._affinity_ids = dlg.selected_ids
+            self.log_box.append(f"相关性：CPU {', '.join(map(str, sorted(self._affinity_ids)))}"
+                                f"（{'已即时生效' if self.worker else '下一段起生效'}）")
+            if self.worker:
+                self.worker.set_affinity(self._affinity_ids)
+
     # —— 运行 ——
     def _start(self):
         if self.worker or not self._items:
             return
         self.worker = ArchiveWorker(list(self._items), self.crf_slider.value(),
-                                    self._container_key())
+                                    self._container_key(),
+                                    affinity_ids=self._affinity_ids)
         self.worker.taskProgress.connect(
             lambda name, dn, t: (self.bar.setMaximum(t),
                                  self.bar.setValue(dn)) if t else None)
@@ -408,13 +542,44 @@ class ArchivePage(QWidget):
             p = Path(name)
             self._items = [x for x in self._items if x[0] != p]
             self._take_item(p)
+        elif "暂停" in msg or "放弃" in msg:
+            self._sync_start_text()
 
     def _on_all_done(self, ok: bool, msg: str):
         self.log_box.append(f"— {msg} —")
         self.worker = None
         self._sync_buttons()
         self.bar.setValue(0)
+        self.start_btn.setText("开始存档")
 
-    def _stop(self):
+    def _sync_start_text(self):
+        """有任一源片带分片 → 按钮变「继续存档」。"""
+        cs = CodecSettings()
+        cs.crf = self.crf_slider.value()
+        cs.container = self._container_key()
+        has_parts = any(parts_dir(p, cs).exists() for p, _ in self._items)
+        self.start_btn.setText("继续存档" if has_parts else "开始存档")
+
+    def _pause(self):
+        if self.worker:
+            self.worker.pause()
+            self.pause_btn.setEnabled(False)
+            self.log_box.append("暂停中：当前段已终止作废（已完成段保留）…")
+
+    def _abandon(self):
         if self.worker:
             self.worker.cancel()
+            self.abandon_btn.setEnabled(False)
+            self.log_box.append("放弃中：当前段将被终止，分片与残件一并删除…")
+        else:
+            cs = CodecSettings()
+            cs.crf = self.crf_slider.value()
+            cs.container = self._container_key()
+            for p, _ in self._items:
+                d = parts_dir(p, cs)
+                if d.exists():
+                    for f in d.iterdir():
+                        f.unlink(missing_ok=True)
+                    d.rmdir()
+                    self.log_box.append(f"已清除 {p.name} 的未完成分片")
+            self._sync_start_text()

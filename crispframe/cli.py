@@ -3,7 +3,11 @@
 用法：
   python -m crispframe input.mkv                        # 存档：SVT-AV1 crf30/preset4 → MKV
   python -m crispframe input.mkv --crf 27 --container mp4
+  python -m crispframe input.mkv --affinity p           # 只用大核（或 e/0,2,4-7）
   python -m crispframe 源.mp4 --verify-only 成品.mkv     # 只验证已有成品
+
+分段存档：长片按 600s 切段逐段直编；Ctrl-C 或中途退出会保留已完成分片，
+重新运行同一命令自动从断点续跑；--restart 清除分片从头再来。
 """
 import argparse
 import shutil
@@ -11,21 +15,70 @@ import sys
 import time
 from pathlib import Path
 
+from . import affinity
 from .ffutils import probe
-from .codec import (available_containers, CodecSettings,
-                    build_encode_config_kwargs, is_svt_8k_error,
-                    svtav1_fix_preset)
-from .pipeline import (EncodeConfig, PassthroughCanceled, SilentTermination,
-                       run_passthrough)
-from .verify import human_size, probe_stream_meta, verify_output
+from .codec import available_containers, CodecSettings
+from .pipeline import PassthroughCanceled
+from .archive_job import parts_dir, run_segmented
+from .verify import human_size, verify_output
+
+
+def archive_pix_fmt_probe(src: Path):
+    from .codec import archive_pix_fmt
+    from .verify import probe_stream_meta
+    return archive_pix_fmt(probe_stream_meta(src)["pix_fmt"])
+
+
+def _parse_affinity(spec: str):
+    """解析 --affinity：返回逻辑处理器列表；"auto" 返回 None（不干预）；
+    解析失败返回哨兵 "bad"。"""
+    s = (spec or "auto").strip().lower()
+    if not s or s == "auto":
+        return None
+    try:
+        p_set, e_set = affinity.topology()
+    except Exception as e:  # noqa: BLE001
+        print(f"错误: 本机 CPU 拓扑读取失败（{e}），--affinity 不可用", file=sys.stderr)
+        return "bad"
+    all_cpus = sorted(set(p_set) | set(e_set))
+    if s == "all":
+        return all_cpus
+    if s == "p":
+        if not p_set:
+            print("提示: 本机无大核（非混合架构），--affinity p 不生效", file=sys.stderr)
+        return p_set
+    if s == "e":
+        if not e_set:
+            print("提示: 本机无小核（非混合架构），--affinity e 不生效", file=sys.stderr)
+        return e_set
+    ids: list[int] = []
+    try:
+        for token in s.split(","):
+            token = token.strip()
+            if "-" in token:
+                a, b = token.split("-")
+                ids.extend(range(int(a), int(b) + 1))
+            else:
+                ids.append(int(token))
+    except ValueError:
+        print(f"错误: 无法解析 --affinity {spec!r}（支持 auto/all/p/e/"
+              f"逗号编号如 0,2,4-7）", file=sys.stderr)
+        return "bad"
+    ids = sorted(set(ids))
+    bad = [i for i in ids if i not in all_cpus]
+    if bad or not ids:
+        print(f"错误: --affinity {spec!r} 中的逻辑处理器不存在"
+              f"（本机: {','.join(map(str, all_cpus))}）", file=sys.stderr)
+        return "bad"
+    return ids
 
 
 def main(argv=None) -> int:
     _cont_list = "、".join(sorted(available_containers("svtav1")))
     ap = argparse.ArgumentParser(
         prog="crispframe",
-        description="开源视频归档压缩工具：SVT-AV1 直编（全流保留、色彩/时基跟随源），"
-                    "编码后自动三项验证（体积/元数据/全量解码查错）")
+        description="开源视频归档压缩工具：SVT-AV1 分段直编（全流保留、色彩/时基跟随源、"
+                    "断点续跑），编码后自动三项验证（体积/元数据/全量解码查错）")
     ap.add_argument("input", type=Path, nargs="?", default=None,
                     help="输入视频；--verify-only 时可选作对照源")
     ap.add_argument("-o", "--output", type=Path, default=None,
@@ -40,6 +93,11 @@ def main(argv=None) -> int:
     ap.add_argument("--force", action="store_true", help="输出已存在时覆盖")
     ap.add_argument("--no-verify", action="store_true",
                     help="跳过编码后验证（不推荐，未验证前勿删源片）")
+    ap.add_argument("--affinity", default="auto",
+                    help="CPU 亲和性：auto（不干预，默认）/ all（全开）/ p（仅大核）/ "
+                         "e（仅小核）/ 逗号分隔逻辑处理器编号（如 0,2,4-7）")
+    ap.add_argument("--restart", action="store_true",
+                    help="忽略/清除已有未完成分片，从头开始存档")
     ap.add_argument("--verify-only", metavar="成品.mkv",
                     help="跳过编码，只对已有成品跑三项验证；位置参数可选作对照源"
                          "（python -m crispframe 源.mp4 --verify-only 成品.mkv）")
@@ -91,8 +149,7 @@ def main(argv=None) -> int:
         cs.container = args.container
     # 像素格式映射（存档原则：输出元数据与源一致，验证严格比对 pix_fmt）；
     # 4:2:2/4:4:4 等格式在此预检拒绝，不空转编码
-    from .codec import archive_pix_fmt
-    pix = archive_pix_fmt(probe_stream_meta(args.input)["pix_fmt"])
+    pix = archive_pix_fmt_probe(args.input)
     if pix is None:
         print("错误: 源像素格式超出严格一致支持范围（仅 yuv420p / yuv420p10le "
               "可保持输出元数据一致）。请用 ffmpeg 直编或先把源转为 4:2:0。",
@@ -115,48 +172,53 @@ def main(argv=None) -> int:
     print(f"输入: {info.width}x{info.height} @ {info.fps:.3f}fps, "
           f"{info.frames or '?'} 帧, {info.duration:.1f}s")
 
+    # ---- 相关性解析 ----
+    affinity_ids = _parse_affinity(args.affinity)
+    if affinity_ids == "bad":
+        return 2
+
     verify_tag = "编码后自动验证" if not args.no_verify else "验证已跳过"
-    # 8K 级分辨率（面积阈值见 codec.SVT_8K_AREA）SVT 拒绝 preset<5，主动上调
-    svt_fixed, svt_bumped = svtav1_fix_preset(cs.preset, info.width, info.height)
-    if svt_bumped:
-        cs.preset = svt_fixed
-        print(f"提示: {info.width}x{info.height} 为 8K 级分辨率，"
-              f"SVT-AV1 自动上调 preset{cs.preset}")
-    print(f"存档: 单进程直编 SVT-AV1 crf{cs.crf}/preset{cs.preset} → "
-          f"{cs.container}，全流保留（多音轨/字幕/章节），色彩/时基跟随源，{verify_tag}")
+    print(f"存档: SVT-AV1 crf{cs.crf}/preset{cs.preset} → {cs.container}，"
+          f"分段直编（断点可续跑/暂停），全流保留（多音轨/字幕/章节），"
+          f"色彩/时基跟随源，{verify_tag}")
+    if args.restart:
+        d = parts_dir(args.input, cs)
+        if d.exists():
+            for f in d.iterdir():
+                f.unlink(missing_ok=True)
+            d.rmdir()
+            print("已清除未完成分片，从头开始存档")
+        else:
+            print("没有未完成分片，直接开始")
     t0 = time.perf_counter()
     try:
-        for attempt in range(2):
-            encode = EncodeConfig(**build_encode_config_kwargs(cs, map_all=True))
-            try:
-                run_passthrough(info, out_path, encode=encode,
-                                progress_callback=lambda d, t: print(
-                                    f"\r编码进度 {d:.0f}/{t:.0f}s", end="", flush=True),
-                                cancel_check=None)
-                break
-            except PassthroughCanceled:
-                raise
-            except Exception as e:
-                # 编码失败：残件顶着最终存档命名落盘有误归档风险（下次需 --force），删除之
-                out_path.unlink(missing_ok=True)
-                if attempt == 0 and cs.preset < 5 and is_svt_8k_error(str(e)):
-                    print(f"\n提示: SVT 拒绝该分辨率的 preset{cs.preset}"
-                          f"（8K 级限制），自动改用 preset5 重试")
-                    cs.preset = 5
-                    continue
-                if attempt == 0 and isinstance(e, SilentTermination):
-                    print("\n提示: 编码进程被外部终止（无错误输出），自动重试一次")
-                    continue
-                raise
+        result = run_segmented(
+            info, args.input, out_path, cs,
+            cancel_check=None,
+            pause_check=None,
+            progress_cb=lambda d, t: print(
+                f"\r编码进度 {d:.0f}/{t:.0f}s", end="", flush=True),
+            log_cb=lambda m: print(m, flush=True),
+            on_process=(lambda proc: affinity.apply(proc, affinity_ids))
+            if affinity_ids else None)
+    except KeyboardInterrupt:
+        print("\n已暂停（分片保留）。继续存档：重新运行同一命令即可从断点续跑；"
+              "放弃：加 --restart")
+        return 130
     except PassthroughCanceled:
         print("\n已取消")
         return 130
     except Exception as e:
-        print(f"\n[错误] 编码失败（残缺产物已删除，源片保留）: {str(e)[:500]}",
+        print(f"\n[错误] 存档失败（分片与残件已删除，源片保留）: {str(e)[:500]}",
               file=sys.stderr)
         return 1
     finally:
         print()
+    if result == "pause":
+        print("已暂停（分片保留）。继续存档：重新运行同一命令即可从断点续跑")
+        return 130
+    if result != "ok":
+        return 1
     wall = time.perf_counter() - t0
     if out_path.exists():
         print(f"编码完成: {wall:.0f}s / {human_size(out_path.stat().st_size)}")
@@ -169,12 +231,15 @@ def main(argv=None) -> int:
         for f in vr.failures:
             print("  " + f)
         if vr.ok:
+            shutil.rmtree(parts_dir(args.input, cs), ignore_errors=True)
             print("结论: ✓ 验证全部通过，可归档")
             return 0
-        # 未过验证 = 不可归档：产物以最终存档命名留在盘上有误归档风险，删除之
+        # 未过验证 = 不可归档：删除成品与分片（分片重编也无法消除坏段）
         out_path.unlink(missing_ok=True)
+        shutil.rmtree(parts_dir(args.input, cs), ignore_errors=True)
         print("\n验证未通过，产物已删除（源片保留），不要删除源片！")
         return 1
+    shutil.rmtree(parts_dir(args.input, cs), ignore_errors=True)
     return 0
 
 

@@ -27,21 +27,33 @@ def run_passthrough(
     info: VideoInfo,
     out_path: Path,
     encode: EncodeConfig | None = None,
-    max_seconds: float | None = None,
+    start: float | None = None,       # 段起点（秒）；None=整片
+    duration: float | None = None,    # 段长（秒）；与 start 配合做分段存档
     progress_callback=None,      # progress_callback(done_s, total_s)——单位是秒
     cancel_check=None,
+    process_hook=None,           # process_hook(proc)：Popen 后回调（亲和性切换用）
 ) -> dict:
     """存档直编：单进程 ffmpeg 解码→编码。
 
     - 解码与编码同进程，SVT-AV1 内部全核线程——CPU 满载
     - 色彩/时基元数据 passthrough（不注 bt709、不 -vf），HDR 等特殊色彩
       原样保留，产物元数据与源一致
-    - 源即输入 0，`-map 0` 全映射（多音轨/字幕/章节/元数据跟随源）"""
+    - 源即输入 0，`-map 0` 全映射（多音轨/字幕/章节/元数据跟随源）
+    - start/duration：分段存档的段区间。采用双 -ss（先快速关键帧定位、
+      再精确解码裁剪）——单 -ss 会把关键帧提前量的预滚全部混入段尾
+      （实测 30s 段混入 9.2s），双 -ss 段长精确（实测 ±0.02s）"""
     encode = encode or EncodeConfig()
     cmd = [ffmpeg(), "-nostdin", "-hide_banner", "-loglevel", "error", "-y",
-           "-progress", "pipe:1", "-i", str(info.path)]
-    if max_seconds is not None:
-        cmd += ["-t", f"{max_seconds:.3f}"]
+           "-progress", "pipe:1"]
+    if start is not None and start > 0:
+        # 双 -ss：第一跳关键帧（回退 15s 窗口，覆盖常见 GOP），第二跳精确裁剪
+        fast = max(0.0, start - 15.0)
+        cmd += ["-ss", f"{fast:.3f}", "-i", str(info.path),
+                "-ss", f"{start - fast:.3f}"]
+    else:
+        cmd += ["-i", str(info.path)]
+    if duration is not None:
+        cmd += ["-t", f"{duration:.3f}"]
     if encode.map_all_streams:
         # 存档语义：全流保留（音轨/字幕/附件位流之外的映射由 -map 0 覆盖），
         # 章节/全局元数据同样取自源；数据流丢弃
@@ -60,6 +72,8 @@ def run_passthrough(
 
     proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                             text=True, errors="replace", **SUBPROC_FLAGS)
+    if process_hook is not None:
+        process_hook(proc)
     assert proc.stdout is not None and proc.stderr is not None
     err_holder: list[str] = []
 
@@ -73,7 +87,7 @@ def run_passthrough(
 
     t = threading.Thread(target=drain_errors, daemon=True)
     t.start()
-    total = info.duration or 0.0
+    total = duration if duration is not None else (info.duration or 0.0)
     last_t = [0.0]                   # 最后一次进度（静默终止时报告死在哪）
     for line in proc.stdout:
         if cancel_check and cancel_check():
