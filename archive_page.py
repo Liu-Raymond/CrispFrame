@@ -11,10 +11,11 @@ passthrough）与 crispframe.verify（体积/元数据/全量解码查错）。
 from __future__ import annotations
 
 import shutil
+import subprocess
 import time
 from pathlib import Path
 
-from PySide6.QtCore import Qt, QThread, Signal
+from PySide6.QtCore import Qt, QThread, QTimer, Signal
 from PySide6.QtWidgets import (QCheckBox, QComboBox, QDialog, QFileDialog,
                                QGridLayout, QGroupBox, QHBoxLayout, QLabel,
                                QListWidget, QPushButton, QProgressBar, QSlider,
@@ -24,7 +25,7 @@ from crispframe import affinity
 from crispframe.archive_job import parts_dir, run_segmented
 from crispframe.codec import (VIDEO_CONTAINERS, available_containers,
                               archive_pix_fmt, CodecSettings)
-from crispframe.ffutils import VideoInfo, probe
+from crispframe.ffutils import SUBPROC_FLAGS, VideoInfo, probe
 from crispframe.pipeline import PassthroughCanceled
 from crispframe.verify import human_size, probe_stream_meta, verify_output
 
@@ -345,6 +346,10 @@ class ArchivePage(QWidget):
                                 "默认不干预")
         self.aff_btn.clicked.connect(self._open_affinity)
         crow.addWidget(self.aff_btn)
+        self.shutdown_cb = QCheckBox("完成后关机")
+        self.shutdown_cb.setToolTip("全部任务成功完成后 60 秒自动关机（挂机过夜用；"
+                                    "期间可点「取消关机」）")
+        crow.addWidget(self.shutdown_cb)
         v.addLayout(crow)
 
         row = QHBoxLayout()
@@ -395,7 +400,13 @@ class ArchivePage(QWidget):
         self.start_btn.setEnabled(False)
         self.start_btn.clicked.connect(self._start)
         bar.addWidget(self.start_btn)
+        self.cancel_sd_btn = QPushButton("取消关机")
+        self.cancel_sd_btn.setVisible(False)
+        self.cancel_sd_btn.setObjectName("stopBtn")
+        self.cancel_sd_btn.clicked.connect(self._cancel_shutdown)
+        bar.addWidget(self.cancel_sd_btn)
         v.addLayout(bar)
+        self._sd_timer: QTimer | None = None
 
         self.bar = QProgressBar()
         v.addWidget(self.bar)
@@ -532,6 +543,7 @@ class ArchivePage(QWidget):
         self.worker.log.connect(self.log_box.append)
         self.worker.fileDone.connect(self._on_file_done)
         self.worker.allDone.connect(self._on_all_done)
+        self._cancel_shutdown(silent=True)
         self._sync_buttons()
         self.bar.setValue(0)
         self.worker.start()
@@ -551,6 +563,41 @@ class ArchivePage(QWidget):
         self._sync_buttons()
         self.bar.setValue(0)
         self.start_btn.setText("开始存档")
+        if ok and self.shutdown_cb.isChecked():
+            self._begin_shutdown_countdown()
+
+    # —— 自动关机 ——
+    def _begin_shutdown_countdown(self, seconds: int = 60):
+        self._shutdown_left = seconds
+        self.log_box.append(f"全部完成：{seconds} 秒后自动关机"
+                            f"（点「取消关机」可中止）")
+        self.cancel_sd_btn.setVisible(True)
+        self._sync_shutdown_btn()
+        self._sd_timer = QTimer(self)
+        self._sd_timer.setInterval(1000)
+        self._sd_timer.timeout.connect(self._shutdown_tick)
+        self._sd_timer.start()
+
+    def _sync_shutdown_btn(self):
+        self.cancel_sd_btn.setText(f"取消关机（{self._shutdown_left}s）")
+
+    def _shutdown_tick(self):
+        self._shutdown_left -= 1
+        if self._shutdown_left <= 0:
+            self._cancel_shutdown(silent=True)
+            self.log_box.append("正在关机…")
+            subprocess.run(["shutdown", "/s", "/t", "0"],
+                           capture_output=True, **SUBPROC_FLAGS)
+            return
+        self._sync_shutdown_btn()
+
+    def _cancel_shutdown(self, silent: bool = False):
+        if self._sd_timer is not None:
+            self._sd_timer.stop()
+            self._sd_timer = None
+        self.cancel_sd_btn.setVisible(False)
+        if not silent:
+            self.log_box.append("已取消自动关机")
 
     def _sync_start_text(self):
         """有任一源片带分片 → 按钮变「继续存档」。"""

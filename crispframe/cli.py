@@ -11,6 +11,7 @@
 """
 import argparse
 import shutil
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -104,6 +105,8 @@ def main(argv=None) -> int:
                          "e（仅小核）/ 逗号分隔逻辑处理器编号（如 0,2,4-7）")
     ap.add_argument("--restart", action="store_true",
                     help="忽略/清除已有未完成分片，从头开始存档")
+    ap.add_argument("--shutdown", action="store_true",
+                    help="存档成功并验证通过后 60 秒自动关机（shutdown /a 可取消）")
     ap.add_argument("--verify-only", metavar="成品.mkv",
                     help="跳过编码，只对已有成品跑三项验证；位置参数可选作对照源"
                          "（python -m crispframe 源.mp4 --verify-only 成品.mkv）")
@@ -239,6 +242,9 @@ def main(argv=None) -> int:
         if vr.ok:
             shutil.rmtree(parts_dir(args.input, cs), ignore_errors=True)
             print("结论: ✓ 验证全部通过，可归档")
+            if args.shutdown:
+                print("60 秒后自动关机（取消：shutdown /a）")
+                subprocess.run(["shutdown", "/s", "/t", "60"], capture_output=True)
             return 0
         # 未过验证 = 不可归档：删除成品与分片（分片重编也无法消除坏段）
         out_path.unlink(missing_ok=True)
