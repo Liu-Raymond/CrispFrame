@@ -16,7 +16,7 @@ import time
 from pathlib import Path
 
 from PySide6.QtCore import Qt, QThread, Signal
-from PySide6.QtWidgets import (QHBoxLayout, QLabel, QListWidget, QComboBox,
+from PySide6.QtWidgets import (QFileDialog, QHBoxLayout, QLabel, QListWidget, QComboBox,
                                QPushButton, QProgressBar, QSlider, QTextEdit,
                                QVBoxLayout, QWidget)
 
@@ -91,8 +91,7 @@ class ArchiveWorker(QThread):
         - SVT 拒绝 8K 级分辨率的 preset<5 → 按报错标志自动上调 preset5；
         - 进程被外部无声终止（零错误输出，环境性瞬时故障）→ 原参数重试一次。"""
         for attempt in range(2):
-            encode = EncodeConfig(**build_encode_config_kwargs(
-                cs, info.fps, False, map_all=True))
+            encode = EncodeConfig(**build_encode_config_kwargs(cs, map_all=True))
             try:
                 run_passthrough(info, out, encode=encode,
                                 progress_callback=lambda dn, t: self.taskProgress.emit(
@@ -194,9 +193,11 @@ class ArchiveWorker(QThread):
         return "fail"
 
 
+VIDEO_EXTS = {".mp4", ".mkv", ".avi", ".webm", ".mov", ".ts", ".m2ts", ".flv"}
+
+
 class ArchivePage(QWidget):
-    """存档压缩独立界面：文件列表 + 一个 CRF 旋钮 + 开始/停止 + 进度与验证日志。"""
-    backRequested = Signal()
+    """存档压缩独立界面：拖入视频 + 一个 CRF 旋钮 + 开始/停止 + 进度与验证日志。"""
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -205,6 +206,7 @@ class ArchivePage(QWidget):
         self._probe_workers: list[ProbeWorker] = []
         self._gen = 0                  # 清空即换代：在途探测的回填按代丢弃
         self.worker: ArchiveWorker | None = None
+        self.setAcceptDrops(True)
 
         v = QVBoxLayout(self)
         v.setContentsMargins(48, 32, 48, 24)
@@ -216,6 +218,12 @@ class ArchivePage(QWidget):
         sub.setStyleSheet("color:#9aa0a8;")
         sub.setWordWrap(True)
         v.addWidget(sub)
+
+        self.drop = QPushButton("＋ 拖入视频文件，或点击选择")
+        self.drop.setObjectName("dropZone")
+        self.drop.setFixedHeight(120)
+        self.drop.clicked.connect(self._pick)
+        v.addWidget(self.drop)
 
         self.file_list = QListWidget()
         self.file_list.setVisible(False)
@@ -264,9 +272,6 @@ class ArchivePage(QWidget):
         bar.addWidget(rm)
         self._list_btns = (clear, rm)
         bar.addStretch()
-        back = QPushButton("← 返回首页")
-        back.clicked.connect(self.backRequested.emit)
-        bar.addWidget(back)
         self.stop_btn = QPushButton("停止")
         self.stop_btn.setEnabled(False)
         self.stop_btn.clicked.connect(self._stop)
@@ -286,8 +291,29 @@ class ArchivePage(QWidget):
         v.addWidget(self.log_box)
 
     # —— 文件管理 ——
+    def _pick(self):
+        files, _ = QFileDialog.getOpenFileNames(
+            self, "选择视频", "", "视频 (*.mp4 *.mkv *.avi *.webm *.mov *.ts *.m2ts *.flv)")
+        self.set_files([Path(f) for f in files])
+
+    def setAcceptDrops(self, *a, **k):      # 覆盖 QWidget 默认行为前先放行
+        super().setAcceptDrops(*a, **k)
+
+    def dragEnterEvent(self, e):
+        if e.mimeData().hasUrls():
+            e.acceptProposedAction()
+
+    def dragMoveEvent(self, e):
+        e.acceptProposedAction()
+
+    def dropEvent(self, e):
+        files = [Path(u.toLocalFile()) for u in e.mimeData().urls()]
+        self.set_files([f for f in files if f.suffix.lower() in VIDEO_EXTS])
+
     def set_files(self, paths: list[Path]):
-        """首页分流入口：入队探测，完成一个亮一个。"""
+        """拖入/选择入口：入队探测，完成一个亮一个。"""
+        if paths:
+            self.file_list.setVisible(True)
         gen = self._gen
         for p in paths:
             if (p in self._probing or any(s == p for s, _ in self._items)
@@ -334,6 +360,7 @@ class ArchivePage(QWidget):
         self.file_list.clear()
         self.file_list.setVisible(False)
         self._sync_buttons()
+        self.drop.setVisible(True)
 
     def _sync_buttons(self):
         busy = self.worker is not None

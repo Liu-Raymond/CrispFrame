@@ -23,9 +23,11 @@ def _find_exe(name: str) -> str:
     p = _EXE_CACHE.get(name)
     if p:
         return p
-    # 随包分发的 ffmpeg 优先：包根 ffmpeg/、包根、runtime 同级目录
+    # 随包分发的 ffmpeg 优先：包根 ffmpeg/ 在 ROOT（runtime/app）上两级；
+    # 源码布局 ROOT=仓库根（无 ffmpeg/ 时落 shutil.which）
     py_dir = Path(sys.executable).resolve().parent
-    for base in (ROOT / "ffmpeg", ROOT, py_dir, py_dir / "ffmpeg"):
+    for base in (ROOT / "ffmpeg", ROOT.parent.parent / "ffmpeg", ROOT,
+                 py_dir, py_dir / "ffmpeg"):
         cand = base / (name + ".exe")
         if cand.exists():
             p = str(cand)
