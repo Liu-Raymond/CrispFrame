@@ -74,6 +74,12 @@ def _parse_affinity(spec: str):
 
 
 def main(argv=None) -> int:
+    # GBK 控制台下日志符号（▶/✓/⚠）会让 print 直接崩——降级为 ? 而非退出
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(errors="replace")
+        except (AttributeError, OSError):
+            pass
     _cont_list = "、".join(sorted(available_containers("svtav1")))
     ap = argparse.ArgumentParser(
         prog="crispframe",
