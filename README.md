@@ -1,124 +1,74 @@
 # CrispFrame
 
-**开源 AI 视频画质增强 —— 让每一帧都锐利。**
+开源的自托管**视频归档压缩工具**：用 SVT-AV1 恒定画质直编，把视频压成体积小、可长期保存、经过完整性验证的档案。PySide6 GUI + 命令行双入口，Windows 便携包开箱即用。
 
-超分 · 插帧 · 降噪 · 压缩伪影修复 · 人脸增强，本地 GPU 推理，免费无订阅。
-Windows + NVIDIA 显卡；GUI 任务流 + 与 GUI 同源的命令行。
+## 它做什么
 
-![CrispFrame](assets/icon.png)
-
-## 它解决什么
-
-把"模型怎么选、参数怎么配"的知识固化成**零配置默认值**，同时保留专家模式：
-
-- **速度**：TensorRT fp16 引擎（按模型×分辨率缓存，首次构建后秒级加载），帧的
-  预处理/后处理全部留在 GPU 上完成
-- **质量**：2x 超分到 4K 是速度正解（4x 模型多算 4 倍再缩小）；tone-match 修正
-  模型固有偏色；bt709 显式色彩管理杜绝 ffmpeg 默认 bt601 偏色
-- **体积**：默认 SVT-AV1 软编码（crf30/preset4，存档级画质；8K 级源——面积
-  ≥20M，如 4K×2 直出——自动升档 preset5，SVT 拒绝该量级的 preset<5）；插帧/超分
-  内容下体积约为 NVENC 硬编的 1/6
-
-## 功能与模型
-
-| 模块 | 默认模型 | 备注 |
-|---|---|---|
-| 超分（真人） | NomosUni 2x (SPAN) | 1080p→4K 正解；备选 Nomos8k-weak 4x |
-| 超分（动漫） | AnimeJaNai HD v3 2x (Compact) | 极快 |
-| 插帧 | RIFE 4.26（UHD 模式自动启用） | 2x 帧率 |
-| 降噪 | SCUNet PSNR / NAFNet SIDD width32 | 0-1 强度混合（≤0.005 不加载模型） |
-| 压缩伪影修复 | deH264 SuperUltraCompact | 超分前置 |
-| 人脸增强 | YuNet 检测 + CodeFormer 修复 | 只处理人脸区域，跨帧 EMA 抑制抖动 |
-
-模型推理通过 [spandrel](https://pypi.org/project/spandrel/) 加载，社区 SPAN/ESRGAN/Compact 架构通吃；
-权重不随仓库分发，放入 `models/pretrained/` 即自动出现在菜单（缺文件自动隐藏）。
-
-## 实测性能（RTX 5070 Ti 16GB，TensorRT 后端）
-
-| 管线 | 速度 |
-|---|---|
-| 真人 720p→4K（NomosUni 2x） | ~41 帧/s |
-| 动漫 1080p→4K（AnimeJaNai 2x） | ~33 帧/s |
-| 4K 插帧（RIFE 4.26 UHD） | ~25 帧/s |
-| **全链 1080p→4K（超分+锐化+SVT-AV1 编码）** | **11.75-16.5 帧/s** |
-
-1 小时 1080p 素材全链处理约 2.5 小时，挂机一晚的量级。
+- **存档压缩**：单进程 ffmpeg 直编（解码与编码同进程，CPU 全核满载），SVT-AV1 恒定画质
+  —— 定版配方 crf30/preset4/tune=0，实测常见素材体积约为源片的 **1/9～1/120**
+- **全流保留**：多音轨、字幕、章节、全局元数据原样跟随源片（`-map 0` 语义）
+- **忠实副本**：位深（8/10bit）、色彩空间、时基（含 VFR）跟随源片；输出元数据与源严格一致
+- **容器全量化**：20 种输出容器，按编码器实测兼容矩阵动态过滤（muxer 层硬拒的不会出现在下拉里）
+- **编码后自动三项验证**：体积报告 / 元数据严格比对（分辨率·帧率·像素格式逐项 + 时长误差<0.5s）/
+  **全片逐帧解码查错**（后台线程收集，可停止）——未通过即删产物，绝不误归档
+- **失败自愈**：SVT 对 8K 级分辨率（面积≥20M）拒绝 preset<5 → 自动升档 preset5；
+  编码进程被外部无声终止（退出码非零且零错误输出）→ 报人话并自动重试一次
+- **像素格式守门**：4:2:2 / 4:4:4 等无法"元数据一致"的源在编码前预检拒绝并给出人话指引
 
 ## 快速开始
 
-### 方式一：便携版（推荐，无需 Python）
+GUI：双击 `CrispFrame.exe`，拖入视频，选 CRF 与容器，点「开始存档」。
 
-从 [Releases](../../releases) 下载 `CrispFrame-x.x.x-win64.zip`，解压后双击 `CrispFrame.exe`。
-要求见包内 `使用说明.md`（Windows 10/11 + NVIDIA 显卡 + 最新驱动）。
-
-### 方式二：从源码运行
+CLI：
 
 ```bash
-# 1) 环境：Python 3.13 + CUDA 12.8 版 PyTorch（Blackwell 必需）
-pip install torch torchvision --index-url https://download.pytorch.org/whl/cu128
-pip install -r requirements.txt
-
-# 2) ffmpeg（含 NVENC/SVT-AV1）
-winget install --id Gyan.FFmpeg -e
-
-# 3) 模型权重放入 models/pretrained/（见下方来源表）
-
-# 4) 运行
-python gui.py                       # GUI
-python -m crispframe 输入.mp4 --tone-match --sharpen 0.6 --target-res 3840x2160
-python -m crispframe 输入.mp4 --target-res x2              # 整数倍直出（模型输出不缩放）
-python -m crispframe 输入.mp4 --content anime --interp 2   # 动漫 + 2x 插帧
-python -m crispframe --list-models  # 查看模型清单与全部参数
+python -m crispframe input.mkv                       # 存档（crf30/preset4 → MKV，自动验证）
+python -m crispframe input.mkv --crf 27 --container mp4
+python -m crispframe input.mkv --preset 5            # 更快的速度档
+python -m crispframe 源.mkv --verify-only 成品.mkv    # 只验证已有成品（含与源逐项比对）
 ```
 
-### 模型权重来源
+产物命名：`{源名}.cf.archive-crf{N}.{容器}`，输出到源片所在目录；同名产物不覆盖（`--force` 覆盖）。
 
-| 文件 | 来源 |
-|---|---|
-| 2xNomosUni_span.safetensors / 4xNomos8k_span_otf_weak…pth / deH264_SuperUltraCompact.safetensors | [OpenModelDB](https://openmodeldb.info)（按名字搜索） |
-| 2x_AnimeJaNai_HD_V3_Sharp1_Compact_430k.pth | [the-database/mpv-upscale-2x_animejanai](https://github.com/the-database/mpv-upscale-2x_animejanai) |
-| scunet_color_real_psnr.pth | [cszn/SCUNet](https://github.com/cszn/SCUNet) |
-| NAFNet-SIDD-width32.pth | [megvii-research/NAFNet](https://github.com/megvii-research/NAFNet)（镜像：[nyanko7/nafnet-models](https://huggingface.co/nyanko7/nafnet-models)） |
-| codeformer.pth + yunet_2023mar.onnx | [sczhou/CodeFormer](https://github.com/sczhou/CodeFormer) / [opencv_zoo](https://github.com/opencv/opencv_zoo) |
-| rife4.26.pkl | [Practical-RIFE](https://github.com/hzwer/Practical-RIFE) |
+## 关键参数
 
-## 自行打包分发
+| 参数 | 默认 | 说明 |
+|---|---|---|
+| `--crf` | 30 | 25-27 稳 / 30 甜点 / 32 省 |
+| `--preset` | 4 | SVT 速度档 1-13，越小越慢越省 |
+| `--container` | mkv | mkv / mp4 / mov / webm / avi / ts …（按本机 ffmpeg 实测过滤） |
+| `--no-verify` | 关 | 跳过编码后验证（不推荐） |
+| `--force` | 关 | 覆盖已存在的同名产物 |
 
-```bash
-# 1) 编译启动器（需 MSVC BuildTools）
-cd launcher && build_launcher.bat
+8K 级分辨率（宽×高 ≥ 20M 像素，如 4K×2 直出）会自动上调 preset ≥5——SVT-AV1 上游限制。
 
-# 2) 组装便携包（python-embed + venv 库 + 权重 + ffmpeg → zip）
-python make_dist.py
-```
+## 实测参考
 
-产物为自包含目录：`CrispFrame.exe`（C 启动器）+ `runtime\`（嵌入式 Python +
-推理栈 + 代码）+ `models\` + `ffmpeg\`。另附 Nuitka 编译备选脚本 `build_exe.py`。
+| 源 | 产物 | 压缩比 |
+|---|---|---|
+| 2.5GB 4K60 H.264 真人片 | 288MB AV1 | ~9:1 |
+| 95GB FFV1 4:4:4 无损母带（44min） | 786MB AV1 | ~124:1 |
+| 26.6MB 1080p 动漫 | 3.0MB AV1 | ~9:1 |
+
+（crf30/preset4；体积与内容强相关，以上为参考点。）
 
 ## 目录结构
 
 ```
-crispframe/          # 管线核心：解码 → stage 链（SR/降噪/…）→ 插帧 → 编码
-  sr.py              #   spandrel 加载 + TRT fp16 + 批处理
-  interp.py _rife/   #   RIFE 4.26（TRT 默认关闭，见提交 fdd0b2a 的排查记录）
-  trt.py             #   ONNX 导出 → TRT 引擎构建/缓存
-  pipeline.py        #   ffmpeg rawvideo 管道 + EncodeConfig
-  codec.py modules.py profiles.py   # 编码设置/模块链/配置文件（GUI 业务层）
-  layout.py          # 包根定位（源码布局 = 便携包布局）
-gui.py gui_preview.py compare_view.py   # GUI v2（任务流/预览/双路对比器）
-launcher/            # C 启动器 + 图标
-make_dist.py build_exe.py              # 便携包组装 / Nuitka 备选
+crispframe/        包（cli / codec / pipeline / verify / ffutils）
+archive_page.py    存档 GUI 页
+gui.py             应用壳
+make_dist.py       便携包构建
+launcher/          Windows 启动器
+tests/             测试（verify / svt8k 预检 / 自愈重试）
 ```
 
 ## 已知限制
 
-- 无 CPU 回退：没有 NVIDIA 显卡无法使用（启动时会提示）
-- Windows 优先：macOS/Linux 未适配（管线大部分跨平台，硬解/编码参数按 Windows 调优）
-- TRT 引擎缓存机器相关：换显卡后删除 `models/engines/` 会自动重建
+- 只做压缩不改内容：无超分/插帧/降噪（AI 处理请用专业工具，处理完的成品同样可以用本工具归档）
+- 源像素格式仅支持 yuv420p / yuv420p10le（4:2:2/4:4:4 源需先转 4:2:0——SVT-AV1 不支持其他采样）
+- 编码为 CPU 软编：速度取决于核心数（4K60 约 0.3-1x 实时），不依赖独立显卡
 
-## 许可
+## License
 
-本项目代码以 [MIT](LICENSE) 发布。
-
-分发自包含包时请注意第三方组件各自许可：ffmpeg（GPLv3）、NVIDIA CUDA/TensorRT
-（NVIDIA EULA）、PySide6（LGPLv3）、RIFE（MIT）、模型权重遵循各自发布页许可。
+MIT

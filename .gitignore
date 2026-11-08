@@ -41,3 +41,7 @@ build/
 launcher/CrispFrame.exe
 launcher/*.obj
 launcher/*.res
+
+# 环境工件
+.zcode/
+mise.toml

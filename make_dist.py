@@ -1,9 +1,8 @@
-r"""组装便携分发包：UniFab 式三层布局，嵌入式 Python runtime。
+r"""组装便携分发包：三层布局，嵌入式 Python runtime。
 
 产物布局（build/CrispFrame/）：
   CrispFrame.exe        薄启动器（launcher/launcher.c 编译产物）
-  runtime\              python-embed + venv 库（torch/TRT/PySide6…）+ app\（代码）
-  models\pretrained\    定版权重（engines 目标机首次运行现场构建；SEEDVR2 极致档已移除）
+  runtime\              python-embed + PySide6 + app\（代码）
   ffmpeg\               ffmpeg / ffprobe
   使用说明.md
 
@@ -20,45 +19,26 @@ ROOT = Path(__file__).resolve().parent
 STAGE = ROOT / "build" / "CrispFrame"
 RUNTIME = STAGE / "runtime"
 SITE = RUNTIME / "Lib" / "site-packages"
-VERSION = "1.2.0"
+VERSION = "2.0.0"
 
-APP_FILES = ["gui.py", "gui_preview.py", "archive_page.py", "compare_view.py"]
-
-# 随包分发的权重（与 registry/质量对比定版一致；缺失项由 registry 存在性门控自动隐藏）
-_DISTRIBUTED_WEIGHTS = [
-    "2xNomosUni_span.safetensors",
-    "2x_AnimeJaNai_HD_V3_Sharp1_Compact_430k.pth",
-    "4xNomos8k_span_otf_weak_no_update_params.pth",
-    "deH264_SuperUltraCompact.safetensors",
-    "scunet_color_real_psnr.pth",
-    "NAFNet-SIDD-width32.pth",
-    "codeformer.pth",
-    "yunet_2023mar.onnx",
-    "rife4.26.pkl",
-]
-
-# site-packages 排除：onnxruntime 零引用；pip 无用；__pycache__ 可再生；
-# torch 的 include/头文件与 .lib 链接器产物、test 目录运行时不需要（省约 1GB）
-
+APP_FILES = ["gui.py", "archive_page.py"]
 
 def _copy_site_packages() -> None:
+    """存档工具只依赖 PySide6：白名单拷贝（旧全量拷贝约 8GB → 约 650MB）。"""
     src = ROOT / ".venv" / "Lib" / "site-packages"
-    if (SITE / "torch").exists() and (SITE / "PySide6").exists():
-        print("[dist] site-packages 已就绪，跳过", flush=True)
-        return
+    keep = {"PySide6", "shiboken6"}      # PySide6 的运行时依赖闭包就这两项
 
     def ignore(directory, names):
-        drop = {n for n in names if n == "__pycache__"}
         base = Path(directory)
-        if base == src:
-            drop |= {n for n in names if n.startswith("onnxruntime") or n == "pip"}
-        if base.name == "torch":
-            drop |= {"include", "test", "include_toolbox"} & set(names)
-        if base.name == "lib" and base.parent.name == "torch":
-            drop |= {n for n in names if n.endswith((".lib", ".a"))}
-        return drop
+        if base != src:
+            return set()
+        return {n for n in names if n != "__pycache__" and n not in keep}
 
-    print("[dist] 复制 site-packages（约 8GB，需要几分钟）…", flush=True)
+    # 整目录重建：旧 stage 的 site-packages 若是 AI 时代的全量拷贝（约 8.5GB），
+    # 增量 copytree 会把 torch/tensorrt 整栈带进 v2.0.0 包
+    if SITE.exists():
+        shutil.rmtree(SITE)
+    print("[dist] 复制 site-packages 白名单（PySide6，约 650MB）…", flush=True)
     shutil.copytree(src, SITE, ignore=ignore, dirs_exist_ok=True)
 
 
@@ -84,7 +64,10 @@ def _ensure_python_embed() -> None:
 
 def _copy_app() -> None:
     app = RUNTIME / "app"
-    app.mkdir(parents=True, exist_ok=True)
+    # 整目录重建：防止复用旧 stage 时把 AI 时代的死文件（compare_view 等）带进包
+    if app.exists():
+        shutil.rmtree(app)
+    app.mkdir(parents=True)
     for f in APP_FILES:
         shutil.copy2(ROOT / f, app / f)
     dst_pkg = app / "crispframe"
@@ -102,16 +85,18 @@ def main() -> int:
 
     if STAGE.exists():
         print(f"[dist] 复用现有 stage {STAGE}（各步骤幂等）", flush=True)
+        # v1.x stage 的 AI 残留（权重/config）不属于 v2.0.0 包
+        for stale in (STAGE / "models", STAGE / "config"):
+            if stale.exists():
+                shutil.rmtree(stale)
+                print(f"[dist] 已清理旧 stage 残留 {stale.name}/", flush=True)
     STAGE.mkdir(parents=True, exist_ok=True)
 
     _ensure_python_embed()
     _copy_site_packages()
     _copy_app()
 
-    # 权重（定版清单）+ ffmpeg + 启动器 + 说明
-    (STAGE / "models" / "pretrained").mkdir(parents=True, exist_ok=True)
-    for w in _DISTRIBUTED_WEIGHTS:
-        shutil.copy2(ROOT / "models" / "pretrained" / w, STAGE / "models" / "pretrained" / w)
+    # ffmpeg + 启动器 + 说明
     ffmpeg_stage = ROOT / "build" / "ffmpeg_bundle"
     if not all((ffmpeg_stage / n).exists() for n in ("ffmpeg.exe", "ffprobe.exe")):
         # 大清理后重建：从本机 ffmpeg 实际位置（ffutils 同款定位链）组装 bundle
@@ -125,7 +110,6 @@ def main() -> int:
         shutil.copy2(ffmpeg_stage / name, STAGE / "ffmpeg" / name)
     shutil.copy2(launcher, STAGE / "CrispFrame.exe")
     shutil.copy2(ROOT / "DIST_README.md", STAGE / "使用说明.md")
-    (STAGE / "config" / "profiles").mkdir(parents=True, exist_ok=True)
 
     # 体积报告
     def du(p: Path) -> float:
@@ -134,7 +118,7 @@ def main() -> int:
     print(f"[dist] runtime = {du(RUNTIME):.2f} GB, 总计 = {du(STAGE):.2f} GB", flush=True)
 
     # zip（bsdtar，系统自带；Compress-Archive 对 >4GB 不可靠）
-    print("[dist] 打 zip（存储模式，约 10GB，需几分钟）…", flush=True)
+    print("[dist] 打 zip（存储模式，约 1GB）…", flush=True)
     zip_path = ROOT / "build" / f"CrispFrame-{VERSION}-win64.zip"
     if zip_path.exists():
         zip_path.unlink()

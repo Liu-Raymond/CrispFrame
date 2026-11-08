@@ -1,7 +1,7 @@
 [project]
 name = "crispframe"
-version = "0.1.0"
-description = "开源 AI 视频画质增强套件：超分、插帧、面部增强、去噪、防抖 —— 让每一帧都锐利"
+version = "2.0.0"
+description = "开源视频归档压缩工具：SVT-AV1 直编、容器全量化、三项完整性验证 —— 一键把视频压成可长期保存的档案"
 readme = "README.md"
 requires-python = ">=3.11"
 license = { text = "MIT" }
