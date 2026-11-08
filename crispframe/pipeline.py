@@ -155,6 +155,7 @@ def run_passthrough(
     t = threading.Thread(target=drain_errors, daemon=True)
     t.start()
     total = info.duration or 0.0
+    last_t = [0.0]                   # 最后一次进度（静默终止时报告死在哪）
     for line in proc.stdout:
         if cancel_check and cancel_check():
             proc.terminate()
@@ -162,23 +163,42 @@ def run_passthrough(
             proc.wait()
             raise PassthroughCanceled()
         # 与 verify 同款：out_time_ms 历史上单位是微秒
-        if progress_callback and total > 0 and line.startswith("out_time_ms="):
+        if line.startswith("out_time_ms="):
             try:
                 us = int(line.split("=", 1)[1].strip())
-                progress_callback(min(us / 1e6, total), total)
+                last_t[0] = min(us / 1e6, total) if total > 0 else us / 1e6
+                if progress_callback and total > 0:
+                    progress_callback(last_t[0], total)
             except ValueError:
                 pass
     t.join(timeout=10)
     proc.wait()
     t.join()
     if proc.returncode != 0:
-        detail = "\n".join(err_holder[:20]) or f"退出码 {proc.returncode}"
+        detail = "\n".join(err_holder[:20])
+        if not detail:
+            # 零错误输出的非零退出：ffmpeg 被外部终止（任务管理器结束进程即此类，
+            # 实测退出码 1 或 0xFFFFFFFF；正常失败必有 stderr，自主取消走 PassthroughCanceled）。
+            # 报人话 + 已编码位置，供上层自愈重试判断
+            pos = (f"已编码到约 {last_t[0]:.0f}/{total:.0f} 秒" if total > 0
+                   else f"已编码到约 {last_t[0]:.0f} 秒")
+            raise SilentTermination(
+                f"编码进程异常终止（退出码 {proc.returncode}），未留下任何错误输出"
+                f"（{pos}）。常见原因：进程被外部结束（任务管理器/杀毒软件）"
+                f"或系统内存压力；若非主动操作，可直接重试")
         raise RuntimeError(f"直通编码失败:\n{detail}")
     return {"canceled": False, "wall_s": 0.0, "passthrough": True}
 
 
 class PassthroughCanceled(RuntimeError):
     """run_passthrough 被用户取消（产物为残缺文件，调用方负责删除）。"""
+
+
+class SilentTermination(RuntimeError):
+    """ffmpeg 非零码退出且零错误输出——被外部终止（任务管理器/杀软/内存压力）。
+
+    正常编码失败必有 stderr（-loglevel error），自主取消走 PassthroughCanceled；
+    这类无声死亡几乎都是环境性的（瞬时），调用方可安全地自动重试一次。"""
 
 
 def run(

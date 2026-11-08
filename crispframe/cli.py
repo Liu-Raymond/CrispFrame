@@ -20,7 +20,8 @@ from .sr import SuperRes
 from .codec import (available_containers, VIDEO_CONTAINERS, CodecSettings,
                     build_encode_config_kwargs, is_svt_8k_error,
                     svtav1_fix_preset)
-from .pipeline import EncodeConfig, PassthroughCanceled, run, run_passthrough
+from .pipeline import (EncodeConfig, PassthroughCanceled, SilentTermination,
+                       run, run_passthrough)
 from .verify import human_size, probe_stream_meta, verify_output
 
 
@@ -359,6 +360,9 @@ def main(argv=None) -> int:
                         print(f"\n提示: SVT 拒绝该分辨率的 preset{cs_archive.preset}"
                               f"（8K 级限制），自动改用 preset5 重试")
                         cs_archive.preset = 5
+                        continue
+                    if attempt == 0 and isinstance(e, SilentTermination):
+                        print("\n提示: 编码进程被外部终止（无错误输出），自动重试一次")
                         continue
                     raise
         except PassthroughCanceled:

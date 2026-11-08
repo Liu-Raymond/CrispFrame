@@ -25,7 +25,8 @@ from crispframe.codec import (VIDEO_CONTAINERS, available_containers,
                               build_encode_config_kwargs,
                               is_svt_8k_error, svtav1_fix_preset)
 from crispframe.ffutils import VideoInfo, probe
-from crispframe.pipeline import EncodeConfig, PassthroughCanceled, run_passthrough
+from crispframe.pipeline import (EncodeConfig, PassthroughCanceled,
+                                 SilentTermination, run_passthrough)
 from crispframe.verify import human_size, probe_stream_meta, verify_output
 
 _CRF_NOTES = {25: "稳", 27: "稳", 30: "甜点", 32: "省"}
@@ -84,10 +85,11 @@ class ArchiveWorker(QThread):
 
     def _encode_selfheal(self, src: Path, info: VideoInfo, out: Path,
                          cs: CodecSettings) -> str:
-        """单进程直编（全流），含 SVT 8K preset 自愈重试。
+        """单进程直编（全流），含两类自愈重试（共用一次重试额度）。
 
-        返回 'ok' / 'cancel' / 错误消息。失败即删残件：SVT 拒绝 8K 级分辨率的
-        preset<5 时按报错标志自动上调 preset5 重试一次（主动阈值外的边界形状）。"""
+        返回 'ok' / 'cancel' / 错误消息。失败即删残件：
+        - SVT 拒绝 8K 级分辨率的 preset<5 → 按报错标志自动上调 preset5；
+        - 进程被外部无声终止（零错误输出，环境性瞬时故障）→ 原参数重试一次。"""
         for attempt in range(2):
             encode = EncodeConfig(**build_encode_config_kwargs(
                 cs, info.fps, False, map_all=True))
@@ -107,6 +109,10 @@ class ArchiveWorker(QThread):
                     self.log.emit(f"⚠ {src.name}: SVT 拒绝该分辨率的 "
                                   f"preset{cs.preset}（8K 级限制），自动改用 preset5 重试")
                     cs.preset = 5
+                    continue
+                if attempt == 0 and isinstance(e, SilentTermination):
+                    self.log.emit(f"⚠ {src.name}: 编码进程被外部终止"
+                                  f"（无错误输出），自动重试一次")
                     continue
                 self.log.emit(f"[错误] {src.name}: {e}")
                 return f"编码失败: {str(e)[:120]}"
