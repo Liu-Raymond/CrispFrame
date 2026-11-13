@@ -533,6 +533,11 @@ class ArchivePage(QWidget):
                 self.worker.set_affinity(self._affinity_ids)
 
     # —— 运行 ——
+    def _on_fps(self, fps: float):
+        """实时帧率上顶层窗口标题（ArchivePage 是中央控件，自身标题不可见）。"""
+        self.window().setWindowTitle(
+            f"CrispFrame — 存档中 · 实时 {fps:.1f} 帧/s")
+
     def _start(self):
         if self.worker or not self._items:
             return
@@ -542,13 +547,12 @@ class ArchivePage(QWidget):
         self.worker.taskProgress.connect(
             lambda name, dn, t: (self.bar.setMaximum(t),
                                  self.bar.setValue(dn)) if t else None)
-        self.worker.fpsTick.connect(
-            lambda fps: self.setWindowTitle(
-                f"存档压缩 — 实时 {fps:.1f} 帧/s"))
+        self.worker.fpsTick.connect(self._on_fps)
         self.worker.log.connect(self.log_box.append)
         self.worker.fileDone.connect(self._on_file_done)
         self.worker.allDone.connect(self._on_all_done)
         self._cancel_shutdown(silent=True)
+        self._base_title = self.window().windowTitle()
         self._sync_buttons()
         self.bar.setValue(0)
         self.worker.start()
@@ -567,7 +571,7 @@ class ArchivePage(QWidget):
         self.worker = None
         self._sync_buttons()
         self.bar.setValue(0)
-        self.setWindowTitle("存档压缩")
+        self.window().setWindowTitle(getattr(self, "_base_title", "CrispFrame — 视频归档压缩"))
         self.start_btn.setText("开始存档")
         if ok and self.shutdown_cb.isChecked():
             self._begin_shutdown_countdown()
