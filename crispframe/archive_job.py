@@ -83,6 +83,7 @@ def run_segmented(
     cancel_check=None,          # -> True：立即终止当前段并放弃（删分片）
     pause_check=None,           # -> True：当前段跑完后暂停（保留分片）
     progress_cb=None,           # progress_cb(done_s, total_s)（整片口径）
+    fps_cb=None,                # fps_cb(realtime_fps)：整片口径实时帧率（2s 节流）
     log_cb=None,                # log_cb(str)
     on_process=None,            # on_process(proc)：每段 ffmpeg 启动后回调
 ) -> str:
@@ -95,6 +96,7 @@ def run_segmented(
     # 统一绝对路径：concat 列表条目相对列表文件解析，混用相对路径会双拼
     src = Path(src).resolve()
     out_path = Path(out_path).resolve()
+    seg_t0_all = [time.perf_counter()]   # 整片编码墙钟（实时 fps 分母；续跑=本会话口径）
 
     # ---- 8K 级 preset 主动上调（与单文件路径同款） ----
     svt_fixed, svt_bumped = svtav1_fix_preset(cs.preset, info.width, info.height)
@@ -146,16 +148,29 @@ def run_segmented(
         part = pd / f"part{i:04d}{cs.ext()}"
         log(f"▶ 段 {i + 1}/{n_segments}（{seg_start:.0f}-{seg_end:.0f}s）")
         t0 = time.perf_counter()
+        seg_frames = int(info.fps * seg_len)     # 段帧数（实时 fps 口径）
+        last_fps_emit = [0.0]                    # fps 提示节流（2s 一次）
         try:
             for attempt in range(2):
                 encode = EncodeConfig(**build_encode_config_kwargs(cs, map_all=True))
                 base = (i * seg_secs) if i else 0    # 进度口径：整片时间
                 try:
+                    def on_progress(dn, tt, b=base):
+                        if progress_cb:
+                            progress_cb(min(b + dn, total_dur), total_dur)
+                        # 实时 fps：整片已编码帧数 / 整片编码墙钟，2s 节流
+                        if fps_cb and seg_frames:
+                            done_frames = int(info.fps * (b + dn))
+                            el = time.perf_counter() - seg_t0_all[0]
+                            now = time.perf_counter()
+                            if now - last_fps_emit[0] >= 2.0:
+                                last_fps_emit[0] = now
+                                fps_cb(done_frames / el if el > 0 else 0.0)
+
                     run_passthrough(
                         info, part, encode=encode,
                         start=seg_start, duration=seg_len,
-                        progress_callback=lambda dn, tt, b=base: progress_cb(
-                            min(b + dn, total_dur), total_dur) if progress_cb else None,
+                        progress_callback=on_progress,
                         cancel_check=cancel_check,
                         process_hook=on_process)
                     break

@@ -50,6 +50,7 @@ class ProbeWorker(QThread):
 
 class ArchiveWorker(QThread):
     taskProgress = Signal(str, int, int)   # 文件名, done, total（编码/验证统一为秒）
+    fpsTick = Signal(float)                # 整片实时帧率（2s 节流）
     log = Signal(str)
     fileDone = Signal(str, bool, str)      # 文件名, 成功, 消息
     allDone = Signal(bool, str)
@@ -151,6 +152,7 @@ class ArchiveWorker(QThread):
                 cancel_check=lambda: self._cancel,
                 pause_check=lambda: self._pause,
                 progress_cb=lambda d, t: self.taskProgress.emit(src.name, int(d), int(t)),
+                fps_cb=lambda fps: self.fpsTick.emit(fps),
                 log_cb=self.log.emit,
                 on_process=self._on_proc)
         except PassthroughCanceled:
@@ -540,6 +542,9 @@ class ArchivePage(QWidget):
         self.worker.taskProgress.connect(
             lambda name, dn, t: (self.bar.setMaximum(t),
                                  self.bar.setValue(dn)) if t else None)
+        self.worker.fpsTick.connect(
+            lambda fps: self.setWindowTitle(
+                f"存档压缩 — 实时 {fps:.1f} 帧/s"))
         self.worker.log.connect(self.log_box.append)
         self.worker.fileDone.connect(self._on_file_done)
         self.worker.allDone.connect(self._on_all_done)
@@ -562,6 +567,7 @@ class ArchivePage(QWidget):
         self.worker = None
         self._sync_buttons()
         self.bar.setValue(0)
+        self.setWindowTitle("存档压缩")
         self.start_btn.setText("开始存档")
         if ok and self.shutdown_cb.isChecked():
             self._begin_shutdown_countdown()
