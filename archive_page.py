@@ -64,10 +64,21 @@ class ArchiveWorker(QThread):
         self.affinity_ids = affinity_ids   # None=不干预；list=逐核勾选集合
         self._cancel = False               # 放弃：终止当前段并删分片
         self._pause = False                # 暂停：当前段跑完（或被立即终止）后保留分片
+        self._halt = False                 # 托盘退出软停：暂停语义 + 跳过剩余文件
         self._proc = None                  # 当前段 ffmpeg 进程（相关性切换用）
 
     def cancel(self):
         self._cancel = True
+
+    def halt(self):
+        """托盘退出软停：走暂停路径（终止当前段/等段界），完成后跳过剩余文件。"""
+        self._halt = True
+        self._pause = True
+        if self._proc is not None:
+            try:
+                self._proc.terminate()
+            except OSError:
+                pass
 
     def pause(self):
         self._pause = True
@@ -102,8 +113,12 @@ class ArchiveWorker(QThread):
                 self.log.emit(f"[错误] {src.name}: {e}")
                 self.fileDone.emit(src.name, False, str(e))
                 ok_all = False
+            if self._halt:              # 托盘退出软停：跳过剩余文件
+                break
         if self._cancel:
             self.allDone.emit(False, "已放弃")
+        elif self._halt:
+            self.allDone.emit(False, "已停止（进度保留，重新打开可续跑）")
         else:
             self.allDone.emit(ok_all, "全部完成" if ok_all else "有文件未完成存档")
 
@@ -300,6 +315,9 @@ class AffinityDialog(QDialog):
 class ArchivePage(QWidget):
     """存档压缩页：拖入视频 + CRF 旋钮 + 暂停/放弃 + 逐核相关性 + 进度与验证日志。"""
 
+    taskProgress = Signal(str, int, int)   # 上浮给主窗口（托盘 tooltip）
+    allDone = Signal(bool, str)            # 上浮给主窗口（气泡通知/托盘退出排空）
+
     def __init__(self, parent=None):
         super().__init__(parent)
         self._items: list[tuple[Path, VideoInfo]] = []
@@ -494,6 +512,15 @@ class ArchivePage(QWidget):
         self._sync_buttons()
         self.drop.setVisible(True)
 
+    def is_busy(self) -> bool:
+        """主窗口托盘保活判断：任务运行中 = True。"""
+        return self.worker is not None
+
+    def halt(self):
+        """托盘退出软停（主窗口调用）：当前段结束后停止，分片保留可续跑。"""
+        if self.worker:
+            self.worker.halt()
+
     def _sync_buttons(self):
         busy = self.worker is not None
         self.start_btn.setEnabled(bool(self._items) and not busy)
@@ -551,6 +578,7 @@ class ArchivePage(QWidget):
         self.worker.log.connect(self.log_box.append)
         self.worker.fileDone.connect(self._on_file_done)
         self.worker.allDone.connect(self._on_all_done)
+        self.worker.taskProgress.connect(self.taskProgress)   # 上浮（托盘 tooltip）
         self._cancel_shutdown(silent=True)
         self._base_title = self.window().windowTitle()
         self._sync_buttons()
@@ -573,6 +601,7 @@ class ArchivePage(QWidget):
         self.bar.setValue(0)
         self.window().setWindowTitle(getattr(self, "_base_title", "CrispFrame — 视频归档压缩"))
         self.start_btn.setText("开始存档")
+        self.allDone.emit(ok, msg)          # 上浮（气泡通知/托盘退出排空）
         if ok and self.shutdown_cb.isChecked():
             self._begin_shutdown_countdown()
 
