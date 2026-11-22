@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import os
 import sys
+import time
 from pathlib import Path
 
 from PySide6.QtCore import Qt
@@ -84,6 +85,7 @@ class TrayMainWindow(QMainWindow):
         self.page = page
         self._quit_pending = False
         self._tray: QSystemTrayIcon | None = None
+        self._last_tip = 0.0                # 托盘 tooltip 节流（1Hz；Shell 调用非免费）
         self.setCentralWidget(page)
         self._setup_tray()
         # 页面状态上浮：进度 → 托盘 tooltip；结束 → 气泡通知 + 待退出则退出
@@ -118,7 +120,10 @@ class TrayMainWindow(QMainWindow):
         self.activateWindow()
 
     def _on_progress(self, _name: str, done: int, total: int):
-        if self._tray is not None and total:
+        # tooltip = Shell_NotifyIcon 调用（非免费）——1Hz 节流
+        now = time.perf_counter()
+        if self._tray is not None and total and now - self._last_tip >= 1.0:
+            self._last_tip = now
             self._tray.setToolTip(f"CrispFrame 存档中 {done * 100 // max(total, 1)}%")
 
     def _on_page_done(self, ok: bool, msg: str):

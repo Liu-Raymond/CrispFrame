@@ -150,19 +150,26 @@ def run_segmented(
         t0 = time.perf_counter()
         seg_frames = int(info.fps * seg_len)     # 段帧数（实时 fps 口径）
         last_fps_emit = [0.0]                    # fps 提示节流（2s 一次）
+        last_prog_emit = [0.0]                   # 进度信号节流（10Hz）：
+        # ffmpeg -progress 每帧一个 out_time 块（60fps 源=60 次/s），逐帧透传会让
+        # GUI 进度条 60Hz 重绘 + 托盘 tooltip Shell 调用 + CLI \r 刷新全链高占用。
+        # 10Hz 对进度条足够平滑，开销降 6 倍。段首强制透传一次。
+        last_prog_emit[0] = 0.0
         try:
             for attempt in range(2):
                 encode = EncodeConfig(**build_encode_config_kwargs(cs, map_all=True))
                 base = (i * seg_secs) if i else 0    # 进度口径：整片时间
                 try:
                     def on_progress(dn, tt, b=base):
+                        now = time.perf_counter()
                         if progress_cb:
-                            progress_cb(min(b + dn, total_dur), total_dur)
+                            if now - last_prog_emit[0] >= 0.1:
+                                last_prog_emit[0] = now
+                                progress_cb(min(b + dn, total_dur), total_dur)
                         # 实时 fps：整片已编码帧数 / 整片编码墙钟，2s 节流
                         if fps_cb and seg_frames:
                             done_frames = int(info.fps * (b + dn))
                             el = time.perf_counter() - seg_t0_all[0]
-                            now = time.perf_counter()
                             if now - last_fps_emit[0] >= 2.0:
                                 last_fps_emit[0] = now
                                 fps_cb(done_frames / el if el > 0 else 0.0)
