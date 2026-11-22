@@ -77,7 +77,25 @@ def _copy_app() -> None:
                     ignore=lambda d, names: {n for n in names if n == "__pycache__"})
 
 
+def _stage_runtime_in_use() -> bool:
+    """便携包的 pythonw/ffmpeg 是否正在运行（重打包会撞 DLL 锁留半残 stage）。"""
+    try:
+        out = subprocess.run(
+            ["powershell", "-NoProfile", "-Command",
+             "Get-Process pythonw,ffmpeg -ErrorAction SilentlyContinue | "
+             "Where-Object { $_.Path -like '*CrispFrame*' } | "
+             "Select-Object -First 1 -ExpandProperty Id"],
+            capture_output=True, text=True, timeout=30)
+        return bool(out.stdout.strip())
+    except Exception:  # noqa: BLE001
+        return False
+
+
 def main() -> int:
+    if _stage_runtime_in_use():
+        print("[dist] 错误: 便携包正在运行（pythonw/ffmpeg），请先关闭软件再打包",
+              file=sys.stderr)
+        return 1
     launcher = ROOT / "launcher" / "CrispFrame.exe"
     if not launcher.exists():
         print("缺 launcher/CrispFrame.exe —— 先在 launcher/ 下跑 build_launcher.bat", file=sys.stderr)
